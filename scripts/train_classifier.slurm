@@ -16,7 +16,7 @@
 # already has requirements.txt installed.
 
 #SBATCH --job-name=zapme-train
-#SBATCH --account=parent_1150
+#SBATCH --account=duey
 #SBATCH --partition=standard
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
