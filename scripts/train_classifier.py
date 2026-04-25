@@ -595,6 +595,11 @@ def train_one_split(
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
     )
+    noise_scale = (
+        model.normalizer.std.detach().to(device).reshape(1, -1, 1)
+        if cfg.feature_noise_std > 0
+        else None
+    )
 
     best_val_acc = -1.0
     best_state: dict[str, torch.Tensor] = {
@@ -611,8 +616,8 @@ def train_one_split(
         for X_batch, y_batch in train_loader:
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
-            if cfg.feature_noise_std > 0:
-                X_batch = X_batch + torch.randn_like(X_batch) * cfg.feature_noise_std
+            if noise_scale is not None:
+                X_batch = X_batch + torch.randn_like(X_batch) * noise_scale * cfg.feature_noise_std
             optim.zero_grad()
             logits = model(X_batch)
             loss = F.cross_entropy(logits, y_batch, label_smoothing=cfg.label_smoothing)
@@ -695,6 +700,11 @@ def train_on_all(
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
     )
+    noise_scale = (
+        model.normalizer.std.detach().to(device).reshape(1, -1, 1)
+        if cfg.feature_noise_std > 0
+        else None
+    )
 
     for epoch in range(1, n_epochs + 1):
         model.train()
@@ -704,8 +714,8 @@ def train_on_all(
         for X_batch, y_batch in loader:
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
-            if cfg.feature_noise_std > 0:
-                X_batch = X_batch + torch.randn_like(X_batch) * cfg.feature_noise_std
+            if noise_scale is not None:
+                X_batch = X_batch + torch.randn_like(X_batch) * noise_scale * cfg.feature_noise_std
             optim.zero_grad()
             logits = model(X_batch)
             loss = F.cross_entropy(logits, y_batch, label_smoothing=cfg.label_smoothing)
