@@ -378,11 +378,7 @@ class SlouchCNN(nn.Module):
             nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 32),
+            nn.Linear(128, 32),
             nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -481,32 +477,62 @@ def fit_normalizer(X_train: np.ndarray) -> FeatureNormalize:
     return FeatureNormalize(mean, std)
 
 
-def train_loop(
-    model: SlouchCNN,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
+def train_one_split(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
     cfg: TrainConfig,
-    device: torch.device,
     label_order: tuple[str, ...],
-) -> None:
-    """Run the full training loop, printing per-epoch metrics.
+    device: torch.device,
+    log_prefix: str = "",
+) -> tuple[SlouchCNN, dict[str, torch.Tensor], float, int, np.ndarray]:
+    """Train one fold with best-checkpoint tracking.
+
+    Builds a fresh normalizer + model from `X_train`, runs `cfg.epochs`
+    epochs, tracks the best val-accuracy checkpoint, and returns it.
+    The caller can either restore the best state into the returned model
+    (for export) or read off the metrics for CV reporting.
 
     Args:
-        model: Initialized `SlouchCNN`.
-        train_loader: DataLoader over the training set.
-        val_loader: DataLoader over the held-out validation set.
-        cfg: Training hyperparameters.
-        device: `'cuda'` or `'cpu'` torch device.
+        X_train: Training tensor `(N, C, T)`.
+        y_train: Training labels `(N,)`.
+        X_val: Validation tensor `(M, C, T)`.
+        y_val: Validation labels `(M,)`.
+        cfg: Hyperparameters.
+        label_order: Class-name tuple ordered by class index.
+        device: `'cuda'` or `'cpu'`.
+        log_prefix: Prefixed to each per-epoch print line. Useful when
+            interleaving multiple folds in the same stdout.
+
+    Returns:
+        `(model, best_state, best_val_acc, best_epoch, best_confusion)`.
 
     Preconditions:
-        - `model` is on `device`.
-        - Both loaders yield `(X, y)` tuples on CPU; the loop moves them.
+        - `X_train`, `X_val` shapes match `(*, NUM_FEATURES, cfg.window_size)`.
+        - `cfg.epochs >= 1`.
 
     Postconditions:
-        - `model` is in eval mode on return with weights from the final
-          epoch (no early stopping; sample sizes are too small for it
-          to be informative).
+        - Model is on `device` with parameters from the *final* epoch
+          (not best). Caller is responsible for `load_state_dict`.
+        - Best-checkpoint state lives on CPU.
     """
+    normalizer = fit_normalizer(X_train)
+    model = SlouchCNN(
+        normalizer, num_classes=len(label_order), dropout=cfg.dropout
+    ).to(device)
+    train_loader = DataLoader(
+        TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val)),
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
     optim = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.learning_rate,
@@ -514,7 +540,9 @@ def train_loop(
     )
 
     best_val_acc = -1.0
-    best_state: dict[str, torch.Tensor] | None = None
+    best_state: dict[str, torch.Tensor] = {
+        k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+    }
     best_epoch = 0
     best_confusion = np.zeros((len(label_order), len(label_order)), dtype=np.int64)
 
@@ -553,20 +581,189 @@ def train_loop(
             best_confusion = val_confusion
             marker = "  *"
         print(
-            f"epoch {epoch:3d} | train loss={train_loss:.4f} acc={train_acc:.3f} "
+            f"{log_prefix}epoch {epoch:3d} | train loss={train_loss:.4f} acc={train_acc:.3f} "
             f"| val acc={val_acc:.3f}  per-class: {per_class_str}{marker}"
         )
 
-    if best_state is not None:
-        print(f"\nRestoring best epoch (epoch {best_epoch}, val acc {best_val_acc:.3f}).")
-        model.load_state_dict(best_state)
+    return model, best_state, best_val_acc, best_epoch, best_confusion
 
-    print("Best-epoch validation confusion matrix (rows=true, cols=pred):")
-    header = "          " + "  ".join(f"{name:>10}" for name in label_order)
-    print(header)
-    for i, name in enumerate(label_order):
-        row = "  ".join(f"{best_confusion[i, j]:>10d}" for j in range(len(label_order)))
-        print(f"{name:>8}  {row}")
+
+def train_on_all(
+    X: np.ndarray,
+    y: np.ndarray,
+    cfg: TrainConfig,
+    label_order: tuple[str, ...],
+    device: torch.device,
+    n_epochs: int,
+) -> SlouchCNN:
+    """Train a fresh model on the entire dataset, no held-out validation.
+
+    Used for the final shipping artifact after CV has measured how well
+    the same training recipe generalizes. Runs for a fixed number of
+    epochs (typically the average best-epoch from CV) since there is no
+    val signal to drive early stopping.
+
+    Args:
+        X: All windows `(N, C, T)`.
+        y: All labels `(N,)`.
+        cfg: Hyperparameters; `cfg.epochs` is overridden by `n_epochs`.
+        label_order: Class-name tuple.
+        device: Torch device.
+        n_epochs: Number of epochs to train for.
+
+    Returns:
+        Trained `SlouchCNN` ready for ONNX export.
+
+    Preconditions:
+        - `n_epochs >= 1`.
+        - `X.shape[1] == NUM_FEATURES`, `X.shape[2] == cfg.window_size`.
+
+    Postconditions:
+        - Returned model is on `device` and in eval mode.
+    """
+    normalizer = fit_normalizer(X)
+    model = SlouchCNN(
+        normalizer, num_classes=len(label_order), dropout=cfg.dropout
+    ).to(device)
+    loader = DataLoader(
+        TensorDataset(torch.from_numpy(X), torch.from_numpy(y)),
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        drop_last=False,
+    )
+    optim = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.learning_rate,
+        weight_decay=cfg.weight_decay,
+    )
+
+    for epoch in range(1, n_epochs + 1):
+        model.train()
+        train_loss_sum = 0.0
+        train_n = 0
+        train_correct = 0
+        for X_batch, y_batch in loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+            optim.zero_grad()
+            logits = model(X_batch)
+            loss = F.cross_entropy(logits, y_batch)
+            loss.backward()
+            optim.step()
+            train_loss_sum += float(loss.item()) * X_batch.size(0)
+            train_correct += int((logits.argmax(dim=-1) == y_batch).sum().item())
+            train_n += X_batch.size(0)
+        train_loss = train_loss_sum / max(train_n, 1)
+        train_acc = train_correct / max(train_n, 1)
+        print(
+            f"[final] epoch {epoch:3d} | train loss={train_loss:.4f} acc={train_acc:.3f}"
+        )
+    return model.eval()
+
+
+def run_loso_cv(
+    X: np.ndarray,
+    y: np.ndarray,
+    sessions: np.ndarray,
+    cfg: TrainConfig,
+    label_order: tuple[str, ...],
+    device: torch.device,
+) -> list[dict[str, object]]:
+    """Run leave-one-session-out cross-validation, one fold per session.
+
+    Args:
+        X: All windows `(N, C, T)`.
+        y: All labels `(N,)`.
+        sessions: Per-window session names `(N,)`.
+        cfg: Hyperparameters (shared across folds).
+        label_order: Class-name tuple.
+        device: Torch device.
+
+    Returns:
+        List of per-fold result dicts containing `session`, `val_acc`,
+        `best_epoch`, `confusion`. Order matches sorted unique sessions.
+
+    Preconditions:
+        - At least 2 unique sessions appear in `sessions`.
+
+    Postconditions:
+        - No model is retained; the function only reports metrics. Final
+          model training is the caller's responsibility.
+    """
+    unique_sessions = sorted(set(sessions))
+    results: list[dict[str, object]] = []
+    for fold_idx, held_out in enumerate(unique_sessions, start=1):
+        print(
+            f"\n=== Fold {fold_idx}/{len(unique_sessions)}: held-out session = {held_out} ==="
+        )
+        val_mask = sessions == held_out
+        train_mask = ~val_mask
+        _, _, best_val_acc, best_epoch, best_confusion = train_one_split(
+            X[train_mask], y[train_mask],
+            X[val_mask], y[val_mask],
+            cfg, label_order, device,
+            log_prefix=f"[fold {fold_idx}] ",
+        )
+        results.append(
+            {
+                "session": held_out,
+                "val_acc": float(best_val_acc),
+                "best_epoch": int(best_epoch),
+                "confusion": best_confusion,
+            }
+        )
+        print(
+            f"[fold {fold_idx}] best epoch={best_epoch}  best val acc={best_val_acc:.3f}"
+        )
+    return results
+
+
+def report_cv(
+    results: list[dict[str, object]],
+    label_order: tuple[str, ...],
+) -> tuple[float, int]:
+    """Print a CV summary and return aggregate stats.
+
+    Args:
+        results: Per-fold output of `run_loso_cv`.
+        label_order: Class-name tuple, used to pretty-print confusions.
+
+    Returns:
+        `(mean_val_acc, median_best_epoch)` aggregates suitable for
+        configuring a final all-data training run.
+
+    Preconditions:
+        - `results` is non-empty.
+
+    Postconditions:
+        - Stdout has a per-fold + aggregate summary plus per-fold
+          confusion matrices.
+    """
+    print("\n=== CV summary ===")
+    accs = [float(r["val_acc"]) for r in results]
+    epochs = [int(r["best_epoch"]) for r in results]
+    for r in results:
+        print(
+            f"  held-out {r['session']!s:<22} "
+            f"val acc={float(r['val_acc']):.3f}  best epoch={int(r['best_epoch']):>2}"
+        )
+    mean_acc = float(np.mean(accs))
+    std_acc = float(np.std(accs))
+    median_epoch = int(np.median(epochs))
+    print(f"  mean val acc = {mean_acc:.3f} ± {std_acc:.3f}")
+    print(f"  median best epoch = {median_epoch}")
+
+    for r in results:
+        confusion = r["confusion"]
+        print(f"\nConfusion (held-out {r['session']}):")
+        header = "          " + "  ".join(f"{name:>10}" for name in label_order)
+        print(header)
+        for i, name in enumerate(label_order):
+            row = "  ".join(
+                f"{int(confusion[i, j]):>10d}" for j in range(len(label_order))
+            )
+            print(f"{name:>8}  {row}")
+    return mean_acc, median_epoch
 
 
 def evaluate(
@@ -702,6 +899,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cv", action="store_true",
+        help=(
+            "Run leave-one-session-out cross-validation, then train a "
+            "final model on ALL sessions for the median best-epoch and "
+            "export that. Mutually exclusive with --val-session."
+        ),
+    )
+    parser.add_argument(
         "--device", type=str, default=None,
         help="'cuda' / 'cpu'. Default: cuda if available, else cpu.",
     )
@@ -759,6 +964,30 @@ def main() -> int:
     label_counts = {name: int((y == i).sum()) for i, name in enumerate(label_order)}
     print(f"Class counts: {label_counts}")
 
+    if args.cv and args.val_session is not None:
+        print("--cv and --val-session are mutually exclusive.", file=sys.stderr)
+        return 1
+
+    upright_index = label_order.index(UPRIGHT_LABEL)
+
+    if args.cv:
+        results = run_loso_cv(X, y, sessions, cfg, label_order, device)
+        mean_acc, median_epoch = report_cv(results, label_order)
+        n_final = max(median_epoch, 1)
+        print(
+            f"\n=== Final training on ALL sessions for {n_final} epochs "
+            f"(median best epoch from CV) ==="
+        )
+        model = train_on_all(X, y, cfg, label_order, device, n_final)
+        export_onnx(model, args.out, cfg.window_size, upright_index)
+        print(
+            f"\nCV mean val acc was {mean_acc:.3f}; final model is trained on "
+            "all {} sessions and exported to {}.".format(
+                len(set(sessions)), args.out
+            )
+        )
+        return 0
+
     X_train, y_train, X_val, y_val = session_aware_split(
         X, y, sessions, args.val_session
     )
@@ -767,26 +996,21 @@ def main() -> int:
         print("Validation set is empty; aborting.", file=sys.stderr)
         return 1
 
-    normalizer = fit_normalizer(X_train)
-    model = SlouchCNN(
-        normalizer, num_classes=len(label_order), dropout=cfg.dropout
-    ).to(device)
-
-    train_loader = DataLoader(
-        TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        drop_last=False,
+    model, best_state, best_val_acc, best_epoch, best_confusion = train_one_split(
+        X_train, y_train, X_val, y_val, cfg, label_order, device
     )
-    val_loader = DataLoader(
-        TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val)),
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        drop_last=False,
-    )
+    print(f"\nRestoring best epoch (epoch {best_epoch}, val acc {best_val_acc:.3f}).")
+    model.load_state_dict(best_state)
 
-    upright_index = label_order.index(UPRIGHT_LABEL)
-    train_loop(model, train_loader, val_loader, cfg, device, label_order)
+    print("Best-epoch validation confusion matrix (rows=true, cols=pred):")
+    header = "          " + "  ".join(f"{name:>10}" for name in label_order)
+    print(header)
+    for i, name in enumerate(label_order):
+        row = "  ".join(
+            f"{int(best_confusion[i, j]):>10d}" for j in range(len(label_order))
+        )
+        print(f"{name:>8}  {row}")
+
     export_onnx(model, args.out, cfg.window_size, upright_index)
     return 0
 
