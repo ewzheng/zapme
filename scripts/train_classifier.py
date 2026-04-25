@@ -85,10 +85,12 @@ class TrainConfig:
     window_size: int = 15
     stride: int = 3
     batch_size: int = 64
-    epochs: int = 20
+    epochs: int = 15
     learning_rate: float = 1e-3
     weight_decay: float = 1e-3
-    dropout: float = 0.4
+    dropout: float = 0.5
+    label_smoothing: float = 0.1
+    feature_noise_std: float = 0.05
 
 
 def load_combined(data_glob: str) -> pd.DataFrame:
@@ -609,9 +611,11 @@ def train_one_split(
         for X_batch, y_batch in train_loader:
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
+            if cfg.feature_noise_std > 0:
+                X_batch = X_batch + torch.randn_like(X_batch) * cfg.feature_noise_std
             optim.zero_grad()
             logits = model(X_batch)
-            loss = F.cross_entropy(logits, y_batch)
+            loss = F.cross_entropy(logits, y_batch, label_smoothing=cfg.label_smoothing)
             loss.backward()
             optim.step()
             train_loss_sum += float(loss.item()) * X_batch.size(0)
@@ -700,9 +704,11 @@ def train_on_all(
         for X_batch, y_batch in loader:
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
+            if cfg.feature_noise_std > 0:
+                X_batch = X_batch + torch.randn_like(X_batch) * cfg.feature_noise_std
             optim.zero_grad()
             logits = model(X_batch)
-            loss = F.cross_entropy(logits, y_batch)
+            loss = F.cross_entropy(logits, y_batch, label_smoothing=cfg.label_smoothing)
             loss.backward()
             optim.step()
             train_loss_sum += float(loss.item()) * X_batch.size(0)
@@ -941,10 +947,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-size", type=int, default=15)
     parser.add_argument("--stride", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
-    parser.add_argument("--dropout", type=float, default=0.4)
+    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument(
+        "--label-smoothing", type=float, default=0.1,
+        help=(
+            "Cross-entropy label smoothing. Caps the model's max "
+            "confidence so it stops slamming train loss to zero by "
+            "epoch 5 — best mid-run val acc is usually higher with this on."
+        ),
+    )
+    parser.add_argument(
+        "--feature-noise-std", type=float, default=0.05,
+        help=(
+            "Stddev of Gaussian noise added to each training feature "
+            "vector per batch (after z-score normalization). Acts as "
+            "feature-space augmentation; helps cross-person generalization."
+        ),
+    )
     parser.add_argument(
         "--multiclass", action="store_true",
         help=(
@@ -997,6 +1019,8 @@ def main() -> int:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         dropout=args.dropout,
+        label_smoothing=args.label_smoothing,
+        feature_noise_std=args.feature_noise_std,
     )
 
     device = torch.device(
