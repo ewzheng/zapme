@@ -25,9 +25,9 @@ import numpy as np
 import onnxruntime as ort
 
 from zapme.src.model._common import create_onnx_session
-from zapme.src.model.features import MLP_FEATURES, NUM_FEATURES
+from zapme.src.model.features import EAR_DROP_INDEX, NUM_FEATURES
 
-EAR_DROP_INDEX: int = MLP_FEATURES.index("ear_drop")
+DEFAULT_WINDOW_SIZE: int = 15
 
 # Hand-tuned placeholder thresholds, calibrated against the early
 # data we collected (upright ear_drop ≈ -0.63, slouch/shrimp ≈ -0.50).
@@ -50,7 +50,7 @@ class ClassifierConfig:
             than producing garbage probabilities.
     """
 
-    window_size: int = 15
+    window_size: int = DEFAULT_WINDOW_SIZE
     num_features: int = NUM_FEATURES
 
 
@@ -75,7 +75,7 @@ class SlouchClassifier:
             weights_path: Path to a `.onnx` file produced by the off-Pi
                 training pipeline, or `None` to use the placeholder.
             config: Window-size / feature-count configuration. Defaults
-                to a 50-step window matching `NUM_FEATURES`.
+                to a `DEFAULT_WINDOW_SIZE`-step window matching `NUM_FEATURES`.
 
         Raises:
             FileNotFoundError: If `weights_path` is provided but the file
@@ -154,10 +154,10 @@ class SlouchClassifier:
         if self._session is None:
             return _placeholder_probability(window)
 
-        batched = window.astype(np.float32, copy=False)[None, :, :]
+        batched = window[None, :, :]
         outputs = self._session.run(None, {self._input_name: batched})
         prob = float(np.asarray(outputs[0]).reshape(-1)[0])
-        return max(0.0, min(1.0, prob))
+        return float(np.clip(prob, 0.0, 1.0))
 
 
 def _placeholder_probability(window: np.ndarray) -> float:

@@ -110,9 +110,9 @@ def create_onnx_session(model_path: Path) -> ort.InferenceSession:
         An `onnxruntime.InferenceSession` ready for `run()`.
 
     Raises:
-        FileNotFoundError: If `model_path` does not exist.
         onnxruntime.capi.onnxruntime_pybind11_state.NoSuchFile: When the
-            session loader rejects the path.
+            session loader cannot read the file (missing, malformed, or
+            unsupported opset).
 
     Preconditions:
         - `model_path` points to a well-formed ONNX graph.
@@ -121,6 +121,4 @@ def create_onnx_session(model_path: Path) -> ort.InferenceSession:
         - Returned session is initialized with the CPU provider only.
         - No mutation of caller-owned state.
     """
-    if not model_path.exists():
-        raise FileNotFoundError(f"ONNX model not found at {model_path}")
     return ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])

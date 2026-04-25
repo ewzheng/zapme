@@ -36,6 +36,7 @@ MLP_FEATURES: tuple[str, ...] = (
     "ear_visibility_asymmetry",
 )
 NUM_FEATURES: int = len(MLP_FEATURES)
+EAR_DROP_INDEX: int = MLP_FEATURES.index("ear_drop")
 
 
 @dataclass(frozen=True)
@@ -103,14 +104,9 @@ class SlouchFeatures:
             - Order matches `MLP_FEATURES` exactly so column indices stay
               stable across the codebase.
         """
+        values = [getattr(self, name) for name in MLP_FEATURES]
         return np.array(
-            [
-                self.ear_drop if self.ear_drop is not None else np.nan,
-                self.nose_drop if self.nose_drop is not None else np.nan,
-                self.ear_forward if self.ear_forward is not None else np.nan,
-                self.shoulder_tilt_deg,
-                self.ear_visibility_asymmetry,
-            ],
+            [np.nan if v is None else v for v in values],
             dtype=np.float32,
         )
 
@@ -144,17 +140,15 @@ def compute_slouch_features(pose: Pose) -> SlouchFeatures | None:
     if l_sho_c < KEYPOINT_CONF_MIN or r_sho_c < KEYPOINT_CONF_MIN:
         return None
 
-    shoulder_width = float(
-        math.hypot(r_sho_x - l_sho_x, r_sho_y - l_sho_y)
-    )
+    dx = r_sho_x - l_sho_x
+    dy = r_sho_y - l_sho_y
+    shoulder_width = float(math.hypot(dx, dy))
     if shoulder_width < SHOULDER_WIDTH_MIN_PX:
         return None
 
     sho_mid_x = (l_sho_x + r_sho_x) / 2.0
     sho_mid_y = (l_sho_y + r_sho_y) / 2.0
 
-    dx = r_sho_x - l_sho_x
-    dy = r_sho_y - l_sho_y
     if dx < 0:
         dx, dy = -dx, -dy
     shoulder_tilt_deg = float(math.degrees(math.atan2(dy, dx)))
@@ -163,21 +157,26 @@ def compute_slouch_features(pose: Pose) -> SlouchFeatures | None:
     r_ear_x, r_ear_y, r_ear_c = kp[RIGHT_EAR]
     ear_visibility_asymmetry = float(l_ear_c - r_ear_c)
 
-    confident_ears: list[np.ndarray] = []
-    if l_ear_c >= KEYPOINT_CONF_MIN:
-        confident_ears.append(kp[LEFT_EAR, :2])
-    if r_ear_c >= KEYPOINT_CONF_MIN:
-        confident_ears.append(kp[RIGHT_EAR, :2])
+    l_ear_ok = l_ear_c >= KEYPOINT_CONF_MIN
+    r_ear_ok = r_ear_c >= KEYPOINT_CONF_MIN
+    if l_ear_ok and r_ear_ok:
+        ear_x = (l_ear_x + r_ear_x) / 2.0
+        ear_y = (l_ear_y + r_ear_y) / 2.0
+    elif l_ear_ok:
+        ear_x, ear_y = l_ear_x, l_ear_y
+    elif r_ear_ok:
+        ear_x, ear_y = r_ear_x, r_ear_y
+    else:
+        ear_x = ear_y = None
 
-    if confident_ears:
-        ear_xy = np.mean(np.stack(confident_ears), axis=0)
-        ear_drop: float | None = float((ear_xy[1] - sho_mid_y) / shoulder_width)
-        ear_forward: float | None = float((ear_xy[0] - sho_mid_x) / shoulder_width)
+    if ear_x is not None:
+        ear_drop: float | None = float((ear_y - sho_mid_y) / shoulder_width)
+        ear_forward: float | None = float((ear_x - sho_mid_x) / shoulder_width)
     else:
         ear_drop = None
         ear_forward = None
 
-    nose_x, nose_y, nose_c = kp[NOSE]
+    _, nose_y, nose_c = kp[NOSE]
     if nose_c >= KEYPOINT_CONF_MIN:
         nose_drop: float | None = float((nose_y - sho_mid_y) / shoulder_width)
     else:
