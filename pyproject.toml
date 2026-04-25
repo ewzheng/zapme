@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zapme"
+version = "0.0.1"
+description = "Vision-driven posture corrector for Raspberry Pi 4 (Hack AZ 2026)."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { file = "LICENSE" }
+
+dependencies = [
+  "huggingface_hub[cli]",
+  "transformers",
+  "datasets",
+  "bitsandbytes",
+  "torch",
+  "torchvision",
+  "pillow",
+  "numpy",
+]
+
+[project.optional-dependencies]
+# Install with: pip install -e .[pi]
+# Only resolves on Linux aarch64 (Raspberry Pi OS 64-bit).
+pi = [
+  "lgpio;     sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "gpiozero;  sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+
+# Install with: pip install -e .[dev]
+dev = [
+  "pytest",
+  "ruff",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
