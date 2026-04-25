@@ -14,6 +14,7 @@ torch
 torchvision
 pillow
 numpy
+onnxruntime
 
 # Pi-only hardware I/O. Resolves only on Linux aarch64 (Pi OS 64-bit).
 lgpio;     sys_platform == "linux" and platform_machine == "aarch64"
