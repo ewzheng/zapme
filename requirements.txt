@@ -14,9 +14,12 @@ torch
 torchvision
 pillow
 numpy
+onnx
 onnxruntime
 opencv-python
 ultralytics
+pyarrow
+pandas
 
 # Utils
 pytest

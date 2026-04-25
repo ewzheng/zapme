@@ -86,8 +86,8 @@ class TrainConfig:
     batch_size: int = 64
     epochs: int = 20
     learning_rate: float = 1e-3
-    weight_decay: float = 5e-4
-    dropout: float = 0.3
+    weight_decay: float = 1e-3
+    dropout: float = 0.4
 
 
 def load_combined(data_glob: str) -> pd.DataFrame:
@@ -374,10 +374,16 @@ class SlouchCNN(nn.Module):
             nn.Flatten(),
         )
         self.head = nn.Sequential(
-            nn.Linear(32, 64),
+            nn.Linear(32, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(32, num_classes),
@@ -685,8 +691,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=5e-4)
-    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--weight-decay", type=float, default=1e-3)
+    parser.add_argument("--dropout", type=float, default=0.4)
     parser.add_argument(
         "--multiclass", action="store_true",
         help=(

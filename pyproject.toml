@@ -19,6 +19,7 @@ dependencies = [
   "torchvision",
   "pillow",
   "numpy",
+  "onnx",
   "onnxruntime",
   "opencv-python",
   "ultralytics",
