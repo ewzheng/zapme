@@ -38,8 +38,33 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from zapme.src.model.features import MLP_FEATURES, NUM_FEATURES
 
-LABEL_ORDER: tuple[str, ...] = ("upright", "slouch", "shrimp")
-UPRIGHT_INDEX: int = LABEL_ORDER.index("upright")
+LABEL_ORDER_MULTI: tuple[str, ...] = ("upright", "slouch", "shrimp")
+LABEL_ORDER_BINARY: tuple[str, ...] = ("upright", "not_upright")
+UPRIGHT_LABEL: str = "upright"
+
+
+def collapse_binary(df: pd.DataFrame) -> pd.DataFrame:
+    """Map the three-class labels onto the binary `upright` / `not_upright` axis.
+
+    Args:
+        df: Combined dataset whose `label` column holds values from
+            `LABEL_ORDER_MULTI`.
+
+    Returns:
+        A copy of `df` with `label` rewritten so any non-`upright` value
+        becomes `not_upright`. Other columns are untouched.
+
+    Preconditions:
+        - `df` contains a `label` column of strings.
+
+    Postconditions:
+        - Returned DataFrame's `label` values are members of
+          `LABEL_ORDER_BINARY`.
+        - Original `df` is not mutated.
+    """
+    out = df.copy()
+    out["label"] = np.where(out["label"] == UPRIGHT_LABEL, UPRIGHT_LABEL, "not_upright")
+    return out
 
 
 @dataclass(frozen=True)
@@ -59,9 +84,10 @@ class TrainConfig:
     window_size: int = 15
     stride: int = 3
     batch_size: int = 64
-    epochs: int = 30
+    epochs: int = 20
     learning_rate: float = 1e-3
-    weight_decay: float = 1e-4
+    weight_decay: float = 5e-4
+    dropout: float = 0.3
 
 
 def load_combined(data_glob: str) -> pd.DataFrame:
@@ -102,6 +128,7 @@ def build_windows(
     df: pd.DataFrame,
     window_size: int,
     stride: int,
+    label_order: tuple[str, ...],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Slice the per-frame DataFrame into fixed-length feature windows.
 
@@ -148,7 +175,7 @@ def build_windows(
     y_chunks: list[int] = []
     session_chunks: list[str] = []
 
-    label_to_idx = {name: i for i, name in enumerate(LABEL_ORDER)}
+    label_to_idx = {name: i for i, name in enumerate(label_order)}
 
     for _, segment in df.groupby(segment_id, sort=False):
         if len(segment) < window_size:
@@ -298,21 +325,37 @@ class FeatureNormalize(nn.Module):
 
 
 class SlouchCNN(nn.Module):
-    """Tiny 1D CNN over (B, NUM_FEATURES, window_size) feature windows.
+    """Two-stage temporal classifier: 1D conv mixer + MLP head.
 
-    Three Conv1d blocks with two max-pools, then global average pooling
-    and two FC layers. Total parameter count is in the low thousands —
-    trains in seconds on any GPU and runs in microseconds on CPU.
+    The conv stage exists only to mix features across time — one
+    `Conv1d(NUM_FEATURES → 32, kernel=5)` with BatchNorm + ReLU gives
+    each output channel a receptive field covering a third of the
+    window, which is plenty for posture (which evolves over seconds, not
+    sub-frames). Adaptive average pooling collapses the time axis to a
+    single 32-dim summary vector. The MLP head then does the actual
+    classification with dropout for regularization.
+
+    Total parameter count is well under 10K — small enough not to
+    overfit ~1300 training windows, large enough that the head can
+    learn nonlinear feature interactions the placeholder rule misses.
     """
 
-    def __init__(self, normalizer: FeatureNormalize, num_classes: int = 3) -> None:
-        """Assemble the CNN with a baked-in normalization head.
+    def __init__(
+        self,
+        normalizer: FeatureNormalize,
+        num_classes: int = 2,
+        dropout: float = 0.3,
+    ) -> None:
+        """Assemble the model with a baked-in normalization head.
 
         Args:
             normalizer: Pre-fitted `FeatureNormalize` placed before the
-                first Conv1d so ONNX export captures the normalization.
-            num_classes: Output class count; defaults to 3 to match
-                `LABEL_ORDER`.
+                conv mixer so ONNX export captures the normalization.
+            num_classes: Output class count. Defaults to `2` (binary
+                upright / not-upright); pass `3` for the original
+                `LABEL_ORDER_MULTI` scheme.
+            dropout: Dropout probability applied between the MLP head's
+                hidden layers.
 
         Preconditions:
             - `normalizer` was fitted on the training set.
@@ -323,21 +366,23 @@ class SlouchCNN(nn.Module):
         """
         super().__init__()
         self.normalizer = normalizer
-        self.body = nn.Sequential(
-            nn.Conv1d(NUM_FEATURES, 16, kernel_size=5, padding=2),
+        self.temporal = nn.Sequential(
+            nn.Conv1d(NUM_FEATURES, 32, kernel_size=5, padding=2),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.Conv1d(16, 32, kernel_size=5, padding=2),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Conv1d(32, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
-            nn.Linear(32, 32),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(32, 64),
             nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(32, num_classes),
         )
+        self.body = nn.Sequential(self.temporal, self.head)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Compute class logits for a batch of windows.
@@ -362,24 +407,29 @@ class SlouchONNXWrapper(nn.Module):
 
     The Pi-side `SlouchClassifier.predict()` consumes a scalar in
     `[0, 1]`. This wrapper applies softmax over the trained classes and
-    returns `1 - P(upright)` so the runtime contract stays unchanged
-    even though we trained multi-class.
+    returns `1 - P(upright)` so the runtime contract is identical
+    whether the underlying classifier was trained binary or multi-class.
     """
 
-    def __init__(self, classifier: SlouchCNN) -> None:
+    def __init__(self, classifier: SlouchCNN, upright_index: int) -> None:
         """Hold a trained classifier; do not modify its parameters.
 
         Args:
             classifier: A trained `SlouchCNN` ready for inference.
+            upright_index: Column of the `upright` class in the
+                classifier's softmax output. Caller is responsible for
+                passing the right value (`label_order.index("upright")`).
 
         Preconditions:
             - `classifier` is in eval mode (caller's responsibility).
+            - `0 <= upright_index < classifier.body[-1].out_features`.
 
         Postconditions:
             - This wrapper carries no extra trainable parameters.
         """
         super().__init__()
         self.classifier = classifier
+        self.upright_index = upright_index
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Compute slouch probability `1 - P(upright)` per batch element.
@@ -391,15 +441,15 @@ class SlouchONNXWrapper(nn.Module):
             Float tensor `(B, 1)` of slouch probabilities in `[0, 1]`.
 
         Preconditions:
-            - The wrapped classifier was trained with `LABEL_ORDER` such
-              that `LABEL_ORDER[UPRIGHT_INDEX] == "upright"`.
+            - The wrapped classifier was trained so that
+              `softmax(logits)[:, upright_index]` is `P(upright)`.
 
         Postconditions:
             - Output values lie in `[0, 1]`.
         """
         logits = self.classifier(x)
         probs = torch.softmax(logits, dim=-1)
-        upright = probs[:, UPRIGHT_INDEX : UPRIGHT_INDEX + 1]
+        upright = probs[:, self.upright_index : self.upright_index + 1]
         return 1.0 - upright
 
 
@@ -431,6 +481,7 @@ def train_loop(
     val_loader: DataLoader,
     cfg: TrainConfig,
     device: torch.device,
+    label_order: tuple[str, ...],
 ) -> None:
     """Run the full training loop, printing per-epoch metrics.
 
@@ -456,6 +507,11 @@ def train_loop(
         weight_decay=cfg.weight_decay,
     )
 
+    best_val_acc = -1.0
+    best_state: dict[str, torch.Tensor] | None = None
+    best_epoch = 0
+    best_confusion = np.zeros((len(label_order), len(label_order)), dtype=np.int64)
+
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         train_loss_sum = 0.0
@@ -473,24 +529,37 @@ def train_loop(
             train_correct += int((logits.argmax(dim=-1) == y_batch).sum().item())
             train_n += X_batch.size(0)
 
-        val_acc, val_per_class, val_confusion = evaluate(model, val_loader, device)
+        val_acc, val_per_class, val_confusion = evaluate(
+            model, val_loader, device, label_order
+        )
 
         train_loss = train_loss_sum / max(train_n, 1)
         train_acc = train_correct / max(train_n, 1)
         per_class_str = "  ".join(
             f"{name}={val_per_class.get(name, float('nan')):.2f}"
-            for name in LABEL_ORDER
+            for name in label_order
         )
+        marker = ""
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch
+            best_confusion = val_confusion
+            marker = "  *"
         print(
             f"epoch {epoch:3d} | train loss={train_loss:.4f} acc={train_acc:.3f} "
-            f"| val acc={val_acc:.3f}  per-class: {per_class_str}"
+            f"| val acc={val_acc:.3f}  per-class: {per_class_str}{marker}"
         )
 
-    print("Final validation confusion matrix (rows=true, cols=pred):")
-    header = "          " + "  ".join(f"{name:>8}" for name in LABEL_ORDER)
+    if best_state is not None:
+        print(f"\nRestoring best epoch (epoch {best_epoch}, val acc {best_val_acc:.3f}).")
+        model.load_state_dict(best_state)
+
+    print("Best-epoch validation confusion matrix (rows=true, cols=pred):")
+    header = "          " + "  ".join(f"{name:>10}" for name in label_order)
     print(header)
-    for i, name in enumerate(LABEL_ORDER):
-        row = "  ".join(f"{val_confusion[i, j]:>8d}" for j in range(len(LABEL_ORDER)))
+    for i, name in enumerate(label_order):
+        row = "  ".join(f"{best_confusion[i, j]:>10d}" for j in range(len(label_order)))
         print(f"{name:>8}  {row}")
 
 
@@ -498,6 +567,7 @@ def evaluate(
     model: SlouchCNN,
     loader: DataLoader,
     device: torch.device,
+    label_order: tuple[str, ...],
 ) -> tuple[float, dict[str, float], np.ndarray]:
     """Compute accuracy, per-class accuracy, and confusion matrix on a loader.
 
@@ -523,7 +593,7 @@ def evaluate(
     model.eval()
     n_total = 0
     n_correct = 0
-    confusion = np.zeros((len(LABEL_ORDER), len(LABEL_ORDER)), dtype=np.int64)
+    confusion = np.zeros((len(label_order), len(label_order)), dtype=np.int64)
     with torch.no_grad():
         for X_batch, y_batch in loader:
             X_batch = X_batch.to(device)
@@ -535,7 +605,7 @@ def evaluate(
                 confusion[int(t), int(p)] += 1
 
     per_class: dict[str, float] = {}
-    for i, name in enumerate(LABEL_ORDER):
+    for i, name in enumerate(label_order):
         row_total = int(confusion[i, :].sum())
         per_class[name] = (
             float(confusion[i, i]) / row_total if row_total > 0 else float("nan")
@@ -548,6 +618,7 @@ def export_onnx(
     model: SlouchCNN,
     out_path: Path,
     window_size: int,
+    upright_index: int,
 ) -> None:
     """Export a slouch-probability ONNX graph from a trained classifier.
 
@@ -557,6 +628,8 @@ def export_onnx(
             absent. Existing files at this path are overwritten.
         window_size: Window length used at training; baked into the
             graph as a fixed input shape.
+        upright_index: Column index of the `upright` class in the
+            classifier's softmax output.
 
     Preconditions:
         - `model.normalizer` holds the training-set normalization stats.
@@ -567,7 +640,7 @@ def export_onnx(
           input and emits `(1, 1)` float32 slouch probability.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cpu_model = SlouchONNXWrapper(model.cpu().eval())
+    cpu_model = SlouchONNXWrapper(model.cpu().eval(), upright_index=upright_index)
     dummy = torch.zeros((1, NUM_FEATURES, window_size), dtype=torch.float32)
     torch.onnx.export(
         cpu_model,
@@ -577,6 +650,7 @@ def export_onnx(
         output_names=["slouch_prob"],
         opset_version=17,
         dynamic_axes=None,
+        dynamo=False,
     )
     print(f"Exported ONNX classifier to {out_path}")
 
@@ -609,9 +683,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-size", type=int, default=15)
     parser.add_argument("--stride", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=5e-4)
+    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument(
+        "--multiclass", action="store_true",
+        help=(
+            "Train on the full upright/slouch/shrimp 3-class label space. "
+            "Default is binary upright vs not_upright, which matches the "
+            "runtime gate's contract and is more robust on small data."
+        ),
+    )
     parser.add_argument(
         "--device", type=str, default=None,
         help="'cuda' / 'cpu'. Default: cuda if available, else cpu.",
@@ -647,6 +730,7 @@ def main() -> int:
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        dropout=args.dropout,
     )
 
     device = torch.device(
@@ -655,13 +739,18 @@ def main() -> int:
     )
     print(f"Device: {device}")
 
+    label_order = LABEL_ORDER_MULTI if args.multiclass else LABEL_ORDER_BINARY
+    print(f"Label scheme: {'multiclass' if args.multiclass else 'binary'}  ({label_order})")
+
     df = load_combined(args.data_glob)
-    X, y, sessions = build_windows(df, cfg.window_size, cfg.stride)
+    if not args.multiclass:
+        df = collapse_binary(df)
+    X, y, sessions = build_windows(df, cfg.window_size, cfg.stride, label_order)
     print(
         f"Built {len(X)} windows of shape {X.shape[1:]}; "
         f"sessions: {sorted(set(sessions))}"
     )
-    label_counts = {name: int((y == i).sum()) for i, name in enumerate(LABEL_ORDER)}
+    label_counts = {name: int((y == i).sum()) for i, name in enumerate(label_order)}
     print(f"Class counts: {label_counts}")
 
     X_train, y_train, X_val, y_val = session_aware_split(
@@ -673,7 +762,9 @@ def main() -> int:
         return 1
 
     normalizer = fit_normalizer(X_train)
-    model = SlouchCNN(normalizer).to(device)
+    model = SlouchCNN(
+        normalizer, num_classes=len(label_order), dropout=cfg.dropout
+    ).to(device)
 
     train_loader = DataLoader(
         TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
@@ -688,8 +779,9 @@ def main() -> int:
         drop_last=False,
     )
 
-    train_loop(model, train_loader, val_loader, cfg, device)
-    export_onnx(model, args.out, cfg.window_size)
+    upright_index = label_order.index(UPRIGHT_LABEL)
+    train_loop(model, train_loader, val_loader, cfg, device, label_order)
+    export_onnx(model, args.out, cfg.window_size, upright_index)
     return 0
 
 
