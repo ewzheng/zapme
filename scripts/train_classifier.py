@@ -994,6 +994,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--final-epochs", type=int, default=None,
+        help=(
+            "Override the number of epochs used for the final all-data "
+            "training run when --cv is set. Default: median best-epoch "
+            "across the CV folds. Useful when CV best-epochs are "
+            "conservative (e.g. early peaks) but train accuracy is "
+            "still climbing — more data lets the model train longer "
+            "without the same overfitting risk."
+        ),
+    )
+    parser.add_argument(
         "--device", type=str, default=None,
         help="'cuda' / 'cpu'. Default: cuda if available, else cpu.",
     )
@@ -1062,11 +1073,18 @@ def main() -> int:
     if args.cv:
         results = run_loso_cv(X, y, sessions, cfg, label_order, device)
         mean_acc, median_epoch = report_cv(results, label_order)
-        n_final = max(median_epoch, 1)
-        print(
-            f"\n=== Final training on ALL sessions for {n_final} epochs "
-            f"(median best epoch from CV) ==="
-        )
+        if args.final_epochs is not None:
+            n_final = max(int(args.final_epochs), 1)
+            print(
+                f"\n=== Final training on ALL sessions for {n_final} epochs "
+                f"(--final-epochs override; CV median was {median_epoch}) ==="
+            )
+        else:
+            n_final = max(median_epoch, 1)
+            print(
+                f"\n=== Final training on ALL sessions for {n_final} epochs "
+                f"(median best epoch from CV) ==="
+            )
         model = train_on_all(X, y, cfg, label_order, device, n_final)
         export_onnx(model, args.out, cfg.window_size, upright_index)
         print(
