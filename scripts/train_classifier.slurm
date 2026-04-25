@@ -17,11 +17,11 @@
 
 #SBATCH --job-name=zapme-train
 #SBATCH --account=duey
-#SBATCH --partition=standard
+#SBATCH --partition=gpu_standard
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:nvidia_a100_80gb_pcie_3g.40gb
 #SBATCH --time=01:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
