@@ -36,7 +36,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from zapme.src.model.features import MLP_FEATURES, NUM_FEATURES
+from zapme.src.model.features import MLP_FEATURES, NUM_FEATURES, compute_slouch_features
+from zapme.src.model.vision import Pose
 
 LABEL_ORDER_MULTI: tuple[str, ...] = ("upright", "slouch", "shrimp")
 LABEL_ORDER_BINARY: tuple[str, ...] = ("upright", "not_upright")
@@ -162,8 +163,12 @@ def build_windows(
         - `NaN` entries are forward-then-backward filled within each
           window's feature row; columns that are entirely NaN within a
           window are zero-filled.
+        - Features are recomputed live from the per-frame raw keypoint
+          columns (`kp_x` / `kp_y` / `kp_conf`) via
+          `features.compute_slouch_features`. Pre-computed feature
+          columns in the parquet (if present) are ignored, so changes to
+          the feature set propagate to training without re-recording.
     """
-    feature_cols = list(MLP_FEATURES)
     df = df.sort_values(["session", "ts"]).reset_index(drop=True)
 
     segment_id = (
@@ -185,7 +190,7 @@ def build_windows(
             continue
         label_idx = label_to_idx[label_name]
         session_name = segment["session"].iloc[0]
-        feats = segment[feature_cols].to_numpy(dtype=np.float32)
+        feats = _features_from_segment(segment)
 
         for start in range(0, len(segment) - window_size + 1, stride):
             window = feats[start : start + window_size, :]
@@ -203,6 +208,56 @@ def build_windows(
     y = np.asarray(y_chunks, dtype=np.int64)
     sessions = np.asarray(session_chunks, dtype=object)
     return X, y, sessions
+
+
+def _features_from_segment(segment: pd.DataFrame) -> np.ndarray:
+    """Recompute per-frame feature vectors from raw keypoint columns.
+
+    Iterating on the feature set should not require re-recording any
+    data. The collector saves raw `kp_x` / `kp_y` / `kp_conf` per frame;
+    this helper recomputes the live feature vector from them on every
+    training run, so adding or removing entries in `MLP_FEATURES`
+    immediately takes effect without touching the parquets.
+
+    Args:
+        segment: Contiguous (session, label) slice with one row per
+            frame. Must contain `kp_x`, `kp_y`, `kp_conf` columns
+            holding length-17 lists, plus `det_score`.
+
+    Returns:
+        Float32 array shaped `(len(segment), NUM_FEATURES)` with `NaN`
+        wherever the live `compute_slouch_features` returned `None`.
+
+    Preconditions:
+        - Each `kp_*` cell is a list / array of length 17 in COCO order.
+
+    Postconditions:
+        - Output ordering matches `MLP_FEATURES`.
+    """
+    n = len(segment)
+    out = np.full((n, NUM_FEATURES), np.nan, dtype=np.float32)
+    kp_x = segment["kp_x"].to_numpy()
+    kp_y = segment["kp_y"].to_numpy()
+    kp_conf = segment["kp_conf"].to_numpy()
+    det = segment["det_score"].to_numpy()
+    for i in range(n):
+        keypoints = np.stack(
+            [
+                np.asarray(kp_x[i], dtype=np.float32),
+                np.asarray(kp_y[i], dtype=np.float32),
+                np.asarray(kp_conf[i], dtype=np.float32),
+            ],
+            axis=1,
+        )
+        pose = Pose(
+            keypoints=keypoints,
+            bbox=np.zeros(4, dtype=np.float32),
+            score=float(det[i]),
+        )
+        feats = compute_slouch_features(pose)
+        if feats is not None:
+            out[i, :] = feats.as_vector()
+    return out
 
 
 def _clean_window(window: np.ndarray) -> np.ndarray:
