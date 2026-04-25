@@ -7,7 +7,7 @@ name = "zapme"
 version = "0.0.1"
 description = "Vision-driven posture corrector for Raspberry Pi 4 (Hack AZ 2026)."
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 
 dependencies = [
@@ -19,6 +19,7 @@ dependencies = [
   "torchvision",
   "pillow",
   "numpy",
+  "pytest",
 ]
 
 [project.optional-dependencies]
