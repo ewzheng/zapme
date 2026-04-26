@@ -456,6 +456,12 @@ class Loop:
         try:
             self._watchdog.start()
             while not self._watchdog.is_tripped():
+                # Heartbeat at the start of each iteration too (in
+                # addition to the end). This bounds the maximum time
+                # between heartbeats to one slow operation, not two,
+                # so a long YOLO call followed by a long camera read
+                # can't stack up to trip the watchdog by itself.
+                self._watchdog.heartbeat()
                 ok, frame = self._camera.read()
                 if not ok:
                     self._logger.error("Camera read failed; exiting loop")

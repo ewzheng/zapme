@@ -100,8 +100,11 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--watchdog-timeout", type=float, default=1.0,
-        help="Seconds without a heartbeat before the watchdog forces the gate low.",
+        "--watchdog-timeout", type=float, default=3.0,
+        help="Seconds without a heartbeat before the watchdog forces the gate low. "
+             "Default of 3.0s comfortably accommodates a single slow inference "
+             "iteration (YOLO + classifier + camera read) on a Pi while still "
+             "catching real hangs — anything stuck for >3s is a real fault.",
     )
     parser.add_argument(
         "--watchdog-check-interval", type=float, default=0.1,

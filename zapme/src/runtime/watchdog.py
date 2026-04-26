@@ -46,7 +46,7 @@ class Watchdog:
     def __init__(
         self,
         gate: Gate,
-        timeout_s: float = 1.0,
+        timeout_s: float = 3.0,
         check_interval_s: float = 0.1,
         logger: logging.Logger | None = None,
     ) -> None:
