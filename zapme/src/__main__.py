@@ -1,27 +1,254 @@
 """Entry point for `python -m zapme.src`.
 
-Boots the runtime loop: initializes the GPIO gate in its safe (off) state,
-opens the camera, loads the posture model, and hands control to the main
-loop. All hardware-specific behavior lives in `zapme.src.runtime`.
+Wires the runtime components together and runs the inference loop:
+camera → pose → features → buffer → classifier → debounce → gate,
+all under a heartbeat watchdog that defaults the EMS line to off on
+any fault.
+
+Two backends are supported behind the same loop:
+
+- `--backend lgpio` (Pi): real GPIO via `lgpio`. Requires the package
+  to be installed and the user to have access to `/dev/gpiochip*`.
+- `--backend fake` (default on non-Linux): in-memory `FakeGate` that
+  logs transitions. Lets the entire loop be exercised on a developer
+  machine without hardware.
 """
 
 from __future__ import annotations
 
+import argparse
+import logging
+import signal
+import sys
+from pathlib import Path
 
-def main() -> None:
-    """Boot the zapme runtime loop.
+from zapme.src.model.classifier import SlouchClassifier
+from zapme.src.model.vision import PoseEstimator
+from zapme.src.runtime.feature_buffer import FeatureBuffer
+from zapme.src.runtime.gate import FakeGate, Gate, LgpioGate
+from zapme.src.runtime.loop import Debouncer, DebouncerConfig, Loop, open_camera
+from zapme.src.runtime.watchdog import Watchdog
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for the runtime entry point.
+
+    Returns:
+        Parsed argparse namespace.
 
     Preconditions:
-        - Process is running on the deployment target (Raspberry Pi 4) with
-          camera and GPIO access available, OR a fake backend has been
-          configured for development.
+        - `sys.argv` is set as expected for a CLI entry point.
 
     Postconditions:
-        - The GPIO gate is left in its safe (off) state on return, including
-          when the loop exits via exception or signal.
+        - Returned namespace exposes camera / model / gate / debouncer
+          / watchdog parameters.
     """
-    raise NotImplementedError("runtime loop not implemented yet")
+    parser = argparse.ArgumentParser(description=__doc__)
+
+    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument(
+        "--repo", type=str, default="Ultralytics/YOLO11",
+        help="Hugging Face repo holding the YOLO pose checkpoint.",
+    )
+    parser.add_argument(
+        "--filename", type=str, default="yolo11n-pose.pt",
+        help="YOLO weights filename within the HF repo.",
+    )
+    parser.add_argument(
+        "--conf", type=float, default=0.25,
+        help="YOLO detection confidence threshold.",
+    )
+    parser.add_argument(
+        "--weights", type=Path, default=Path("models/slouch_cnn.onnx"),
+        help="Trained slouch classifier ONNX path. If absent, the "
+             "placeholder rule is used so the loop still runs.",
+    )
+
+    parser.add_argument(
+        "--backend", choices=("fake", "lgpio"), default=None,
+        help="Gate backend. Defaults to 'lgpio' on Linux aarch64 (Pi), "
+             "'fake' elsewhere.",
+    )
+    parser.add_argument(
+        "--gate-pin", type=int, default=17,
+        help="BCM GPIO pin for LgpioGate.",
+    )
+    parser.add_argument(
+        "--gate-active-low", action="store_true",
+        help="Treat low as the active level (for inverted-logic gating).",
+    )
+
+    parser.add_argument("--on-threshold", type=float, default=0.8)
+    parser.add_argument("--off-threshold", type=float, default=0.4)
+    parser.add_argument("--debounce-window", type=int, default=20)
+    parser.add_argument("--min-on-fraction", type=float, default=0.6)
+
+    parser.add_argument(
+        "--watchdog-timeout", type=float, default=1.0,
+        help="Seconds without a heartbeat before the watchdog forces the gate low.",
+    )
+    parser.add_argument(
+        "--watchdog-check-interval", type=float, default=0.1,
+        help="How often the watchdog thread polls.",
+    )
+
+    parser.add_argument(
+        "--log-interval", type=float, default=1.0,
+        help="Minimum seconds between per-frame log lines.",
+    )
+    parser.add_argument(
+        "--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO",
+    )
+    return parser.parse_args()
+
+
+def _resolve_backend(requested: str | None) -> str:
+    """Pick the gate backend, defaulting based on platform.
+
+    Args:
+        requested: User-provided `--backend` value, or `None` for auto.
+
+    Returns:
+        Either `"lgpio"` or `"fake"`.
+
+    Preconditions:
+        - None.
+
+    Postconditions:
+        - Always returns a string; never raises for unknown platforms.
+    """
+    if requested is not None:
+        return requested
+    if sys.platform.startswith("linux"):
+        return "lgpio"
+    return "fake"
+
+
+def _build_gate(backend: str, pin: int, active_high: bool) -> Gate:
+    """Construct the requested gate backend.
+
+    Args:
+        backend: Either `"lgpio"` or `"fake"`.
+        pin: BCM GPIO pin (used only by `lgpio`).
+        active_high: Active level (used only by `lgpio`).
+
+    Returns:
+        A constructed `Gate` in the off state.
+
+    Raises:
+        ValueError: For unknown backends.
+        ImportError: If `lgpio` is requested but not installed.
+
+    Preconditions:
+        - `backend` was resolved by `_resolve_backend`.
+
+    Postconditions:
+        - The gate is constructed and the line is low.
+    """
+    if backend == "lgpio":
+        return LgpioGate(pin=pin, active_high=active_high)
+    if backend == "fake":
+        return FakeGate()
+    raise ValueError(f"Unknown gate backend: {backend!r}")
+
+
+def main() -> int:
+    """Boot the zapme runtime loop.
+
+    Returns:
+        `0` on a clean exit; `1` if the loop terminated because the
+        watchdog tripped (a hint to systemd / the launcher to restart).
+
+    Preconditions:
+        - Process is running on a host with the requested camera and
+          gate backend available.
+
+    Postconditions:
+        - The gate has been driven low before return, regardless of
+          how the loop exited (clean exit, exception, signal, or
+          watchdog trip).
+    """
+    args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    log = logging.getLogger("zapme")
+
+    backend = _resolve_backend(args.backend)
+    log.info("Gate backend: %s", backend)
+
+    estimator = PoseEstimator(
+        repo_id=args.repo,
+        filename=args.filename,
+        confidence_threshold=args.conf,
+    )
+
+    weights_path = args.weights if args.weights.exists() else None
+    if weights_path is None:
+        log.warning(
+            "Classifier weights not found at %s; using placeholder rule.",
+            args.weights,
+        )
+    classifier = SlouchClassifier(weights_path=weights_path)
+    buffer = FeatureBuffer(config=classifier.config)
+
+    debouncer = Debouncer(
+        config=DebouncerConfig(
+            window_size=args.debounce_window,
+            on_threshold=args.on_threshold,
+            off_threshold=args.off_threshold,
+            min_on_fraction=args.min_on_fraction,
+        )
+    )
+
+    gate = _build_gate(
+        backend=backend,
+        pin=args.gate_pin,
+        active_high=not args.gate_active_low,
+    )
+
+    watchdog = Watchdog(
+        gate=gate,
+        timeout_s=args.watchdog_timeout,
+        check_interval_s=args.watchdog_check_interval,
+        logger=log.getChild("watchdog"),
+    )
+
+    try:
+        camera = open_camera(args.camera)
+    except RuntimeError as exc:
+        log.error(str(exc))
+        gate.close()
+        return 1
+
+    def _signal_handler(signum: int, _frame: object) -> None:
+        log.warning("Received signal %d; stopping watchdog and closing gate.", signum)
+        watchdog.stop()
+        camera.release()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _signal_handler)
+
+    loop = Loop(
+        camera=camera,
+        estimator=estimator,
+        classifier=classifier,
+        buffer=buffer,
+        debouncer=debouncer,
+        gate=gate,
+        watchdog=watchdog,
+        log_interval_s=args.log_interval,
+        logger=log.getChild("loop"),
+    )
+
+    try:
+        return loop.run()
+    finally:
+        camera.release()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
