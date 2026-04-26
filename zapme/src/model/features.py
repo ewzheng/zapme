@@ -30,6 +30,8 @@ LEFT_ELBOW = 7
 RIGHT_ELBOW = 8
 LEFT_WRIST = 9
 RIGHT_WRIST = 10
+LEFT_HIP = 11
+RIGHT_HIP = 12
 ARM_KEYPOINTS = (LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST, RIGHT_WRIST)
 
 KEYPOINT_CONF_MIN = 0.3
@@ -52,6 +54,11 @@ MLP_FEATURES: tuple[str, ...] = (
     "arm_above_shoulder",
     "arm_visibility",
     "head_to_neck_angle_deg",
+    "ear_over_hip",
+    "torso_lean_deg",
+    "hip_visibility",
+    "bbox_aspect",
+    "elbow_drop_avg",
 )
 NUM_FEATURES: int = len(MLP_FEATURES)
 EAR_DROP_INDEX: int = MLP_FEATURES.index("ear_drop")
@@ -148,6 +155,39 @@ class SlouchFeatures:
             length the head deviates by, not raw pixels — so it stays
             comparable across long-necked and short-necked subjects in
             a way that `forward_lean_deg` and `head_pitch` do not.
+        ear_over_hip: `(ear_mid_x - hip_mid_x) / shoulder_width`, or
+            `None` if hips were not visible. The classic ergonomic
+            "ear should sit directly over hip" posture indicator. `0`
+            when the head is aligned over the hips (good posture);
+            positive when the head juts forward of the hips (forward
+            head posture / slouching). Strongest single posture signal
+            when hips are visible.
+        torso_lean_deg: Angle, in degrees, of the `hip_mid →
+            shoulder_mid` vector measured from vertical. `0°` when the
+            torso is upright; positive when the upper body leans
+            forward of the hips. Captures *whole-body* forward lean
+            independently of head position. `None` if hips were not
+            visible.
+        hip_visibility: Mean confidence of the left and right hip
+            keypoints. Always defined. Tells the classifier how much
+            to trust the hip-derived features (`ear_over_hip`,
+            `torso_lean_deg`); near 0 when hips are out of frame
+            (typical at a desk) and near 1 when the user is sitting
+            back enough for the camera to see the full torso.
+        bbox_aspect: Height / width of the bounding box around the
+            visible keypoints (computed from any keypoints with
+            confidence above threshold). Upper-body-only — does not
+            require hips. Tall+narrow when sitting upright; shorter
+            and wider when slouched forward (head approaches camera,
+            shoulders roll outward, bbox becomes more square). `None`
+            if fewer than three keypoints are visible.
+        elbow_drop_avg: Signed mean of `(elbow_y - shoulder_mid_y) /
+            shoulder_width` across visible elbows. Companion to
+            `arm_above_shoulder` (which is clipped at 0 and only
+            reports raised arms); this one captures the elbows'
+            relative position regardless of whether they are above or
+            below the shoulder line. `None` if neither elbow is
+            visible.
     """
 
     shoulder_width_px: float
@@ -167,6 +207,11 @@ class SlouchFeatures:
     arm_above_shoulder: float
     arm_visibility: float
     head_to_neck_angle_deg: float | None
+    ear_over_hip: float | None
+    torso_lean_deg: float | None
+    hip_visibility: float
+    bbox_aspect: float | None
+    elbow_drop_avg: float | None
 
     def as_vector(self) -> np.ndarray:
         """Return the classifier-input vector as a 1D `float32` array.
@@ -372,6 +417,59 @@ def compute_slouch_features(pose: Pose) -> SlouchFeatures | None:
     else:
         head_to_neck_angle_deg = None
 
+    l_hip_x, l_hip_y, l_hip_c = kp[LEFT_HIP]
+    r_hip_x, r_hip_y, r_hip_c = kp[RIGHT_HIP]
+    hip_visibility = float((l_hip_c + r_hip_c) / 2.0)
+    l_hip_ok = l_hip_c >= KEYPOINT_CONF_MIN
+    r_hip_ok = r_hip_c >= KEYPOINT_CONF_MIN
+    if l_hip_ok and r_hip_ok:
+        hip_mid_x: float | None = (l_hip_x + r_hip_x) / 2.0
+        hip_mid_y: float | None = (l_hip_y + r_hip_y) / 2.0
+    elif l_hip_ok:
+        hip_mid_x, hip_mid_y = l_hip_x, l_hip_y
+    elif r_hip_ok:
+        hip_mid_x, hip_mid_y = r_hip_x, r_hip_y
+    else:
+        hip_mid_x = hip_mid_y = None
+
+    if hip_mid_x is not None and ear_x is not None:
+        ear_over_hip: float | None = float((ear_x - hip_mid_x) / shoulder_width)
+    else:
+        ear_over_hip = None
+
+    if hip_mid_x is not None:
+        torso_dx = sho_mid_x - hip_mid_x
+        torso_dy = hip_mid_y - sho_mid_y
+        if torso_dy <= 0:
+            torso_lean_deg: float | None = None
+        else:
+            torso_lean_deg = float(math.degrees(math.atan2(torso_dx, torso_dy)))
+    else:
+        torso_lean_deg = None
+
+    visible_xs: list[float] = []
+    visible_ys: list[float] = []
+    for i in range(kp.shape[0]):
+        if kp[i, 2] >= KEYPOINT_CONF_MIN:
+            visible_xs.append(float(kp[i, 0]))
+            visible_ys.append(float(kp[i, 1]))
+    if len(visible_xs) >= 3:
+        bw = max(visible_xs) - min(visible_xs)
+        bh = max(visible_ys) - min(visible_ys)
+        bbox_aspect: float | None = bh / bw if bw > 0 else None
+    else:
+        bbox_aspect = None
+
+    elbow_drops: list[float] = []
+    for kp_idx in (LEFT_ELBOW, RIGHT_ELBOW):
+        _, elbow_y, elbow_c = kp[kp_idx]
+        if elbow_c >= KEYPOINT_CONF_MIN:
+            elbow_drops.append(float((elbow_y - sho_mid_y) / shoulder_width))
+    if elbow_drops:
+        elbow_drop_avg: float | None = sum(elbow_drops) / len(elbow_drops)
+    else:
+        elbow_drop_avg = None
+
     return SlouchFeatures(
         shoulder_width_px=shoulder_width,
         ear_drop=ear_drop,
@@ -390,4 +488,9 @@ def compute_slouch_features(pose: Pose) -> SlouchFeatures | None:
         arm_above_shoulder=arm_above_shoulder,
         arm_visibility=arm_visibility,
         head_to_neck_angle_deg=head_to_neck_angle_deg,
+        ear_over_hip=ear_over_hip,
+        torso_lean_deg=torso_lean_deg,
+        hip_visibility=hip_visibility,
+        bbox_aspect=bbox_aspect,
+        elbow_drop_avg=elbow_drop_avg,
     )
