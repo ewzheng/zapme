@@ -36,6 +36,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
+from zapme.src.model._common import clean_feature_window
 from zapme.src.model.features import MLP_FEATURES, NUM_FEATURES, compute_slouch_features
 from zapme.src.model.vision import Pose
 
@@ -196,7 +197,7 @@ def build_windows(
 
         for start in range(0, len(segment) - window_size + 1, stride):
             window = feats[start : start + window_size, :]
-            X_chunks.append(_clean_window(window))
+            X_chunks.append(clean_feature_window(window, time_axis=0))
             y_chunks.append(label_idx)
             session_chunks.append(session_name)
 
@@ -259,32 +260,6 @@ def _features_from_segment(segment: pd.DataFrame) -> np.ndarray:
         feats = compute_slouch_features(pose)
         if feats is not None:
             out[i, :] = feats.as_vector()
-    return out
-
-
-def _clean_window(window: np.ndarray) -> np.ndarray:
-    """Forward-fill, backward-fill, then zero-fill NaNs within a window.
-
-    Args:
-        window: Float array shaped `(window_size, NUM_FEATURES)`.
-
-    Returns:
-        Same shape, no NaNs. Caller is responsible for stacking.
-
-    Preconditions:
-        - `window` is a 2D float array.
-
-    Postconditions:
-        - Returned array has no NaN entries.
-        - Original `window` is not mutated.
-    """
-    out = window.copy()
-    for col in range(out.shape[1]):
-        series = pd.Series(out[:, col])
-        series = series.ffill().bfill()
-        if series.isna().all():
-            series = series.fillna(0.0)
-        out[:, col] = series.to_numpy()
     return out
 
 

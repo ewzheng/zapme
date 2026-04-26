@@ -3,10 +3,11 @@
 The temporal classifier wants a fixed-shape `(num_features, window_size)`
 tensor every time it makes a decision. Live frames arrive one at a time
 and may carry `None`-valued features (when shoulder geometry was
-unavailable). This module manages both: it keeps the last `window_size`
-feature vectors as a rolling window, applies a simple imputation
-strategy for missing values, and emits the window in the shape the
-classifier expects.
+unavailable, or individual keypoints were occluded). This module keeps
+the last `window_size` vectors as a rolling window and returns them in
+the shape the classifier expects, with NaN entries cleaned via the
+shared policy in `model/_common.clean_feature_window` so the classifier
+sees the same input distribution it was trained on.
 
 Pure NumPy. Hardware-agnostic. Lives in `runtime/` rather than `model/`
 because it owns *temporal* state (how the loop accumulates frames over
@@ -19,6 +20,7 @@ from collections import deque
 
 import numpy as np
 
+from zapme.src.model._common import clean_feature_window
 from zapme.src.model.classifier import ClassifierConfig
 from zapme.src.model.features import NUM_FEATURES, SlouchFeatures
 
@@ -29,13 +31,14 @@ class FeatureBuffer:
     Insert one vector per camera frame via `push()`; ask for the current
     classifier-shaped window via `as_window()`.
 
-    Missing-value policy: when a pushed `SlouchFeatures` is `None` (no
-    usable shoulder geometry), the buffer carries forward the last good
-    vector instead. This keeps the classifier window dense and lets the
-    runtime treat "no geometry" as "no posture change," which matches
-    the safe-default behavior we want at the gate. If no good vector
-    has ever been observed, missing pushes are stored as all-`NaN`
-    vectors so downstream cleaning still has something to work with.
+    Missing-value policy: each push either stores the live feature
+    vector (with `NaN` for any individual feature whose upstream
+    keypoint was unreliable) or, when no shoulder geometry was usable
+    at all, stores an all-`NaN` placeholder. The actual NaN handling
+    happens lazily in `as_window()` via the shared
+    `model/_common.clean_feature_window` cleaner — same logic the
+    training pipeline uses, so the classifier never sees a different
+    input distribution between train and inference.
     """
 
     def __init__(self, config: ClassifierConfig | None = None) -> None:
@@ -47,8 +50,7 @@ class FeatureBuffer:
                 `NUM_FEATURES` features).
 
         Preconditions:
-            - `config.num_features == NUM_FEATURES`. (The buffer cannot
-              currently bridge a shape mismatch.)
+            - `config.num_features == NUM_FEATURES`.
 
         Postconditions:
             - `len(self) == 0`.
@@ -63,7 +65,6 @@ class FeatureBuffer:
                 f"{NUM_FEATURES}."
             )
         self._buffer: deque[np.ndarray] = deque(maxlen=self._config.window_size)
-        self._last_good: np.ndarray | None = None
 
     @property
     def window_size(self) -> int:
@@ -127,10 +128,6 @@ class FeatureBuffer:
     def push(self, features: SlouchFeatures | None) -> None:
         """Append the next per-frame feature vector to the rolling buffer.
 
-        Carries forward the last good vector when `features` is `None`.
-        Falls back to an all-NaN vector when no good frame has been seen
-        yet (typical at startup before the user is detected).
-
         Args:
             features: Per-frame features, or `None` if shoulder geometry
                 was unusable on this frame.
@@ -142,32 +139,29 @@ class FeatureBuffer:
 
         Postconditions:
             - `len(self)` increases by 1, capped at `window_size`.
-            - `self._last_good` is updated when `features` is non-`None`.
+            - When `features is None`, an all-`NaN` placeholder is
+              appended; cleaning at `as_window()` time will fill it via
+              ffill/bfill from neighboring frames.
         """
         if features is None:
-            if self._last_good is not None:
-                self._buffer.append(self._last_good.copy())
-            else:
-                self._buffer.append(np.full(NUM_FEATURES, np.nan, dtype=np.float32))
-            return
-
-        vec = features.as_vector()
-        self._last_good = vec.copy()
-        self._buffer.append(vec)
+            self._buffer.append(np.full(NUM_FEATURES, np.nan, dtype=np.float32))
+        else:
+            self._buffer.append(features.as_vector())
 
     def as_window(self) -> np.ndarray:
-        """Return the current buffer as a `(num_features, window_size)` array.
+        """Return the current buffer as a cleaned `(num_features, window_size)` array.
 
         Pads on the left with `NaN` columns when the buffer has not yet
-        accumulated a full window. The classifier's NaN-aware decoding
-        handles the padding cleanly (placeholder rule uses `nanmean`;
-        the trained CNN sees a normalized, NaN-filled tensor — see the
-        training script's window cleaner for the matching policy).
+        accumulated a full window, then runs the same NaN cleaner the
+        training pipeline used (`clean_feature_window`) so per-feature
+        ffill / bfill / zero-fill is applied. The classifier therefore
+        always receives a NaN-free tensor in the same input
+        distribution it saw at training time.
 
         Returns:
             `float32` array shaped `(NUM_FEATURES, window_size)`. Newest
-            vector is at column `window_size - 1`; oldest is at `0`. Any
-            unfilled columns at the start are `NaN`.
+            vector is at column `window_size - 1`; oldest is at `0`.
+            No NaN values.
 
         Preconditions:
             - `__init__` has completed.
@@ -175,6 +169,7 @@ class FeatureBuffer:
         Postconditions:
             - Returned array is a fresh allocation; safe for the caller
               to mutate or feed straight to `SlouchClassifier.predict`.
+            - Output contains no NaN values.
         """
         window = np.full(
             (NUM_FEATURES, self._config.window_size), np.nan, dtype=np.float32
@@ -182,10 +177,10 @@ class FeatureBuffer:
         offset = self._config.window_size - len(self._buffer)
         for i, vec in enumerate(self._buffer):
             window[:, offset + i] = vec
-        return window
+        return clean_feature_window(window, time_axis=1)
 
     def reset(self) -> None:
-        """Drop all stored vectors and clear the carry-forward state.
+        """Drop all stored vectors.
 
         Useful when the runtime re-initializes after a fault or a long
         gap (e.g. camera disconnect followed by reconnect) — old vectors
@@ -196,8 +191,5 @@ class FeatureBuffer:
 
         Postconditions:
             - `len(self) == 0`.
-            - Subsequent `push(None)` calls store `NaN` until a good
-              frame arrives, just like a fresh instance.
         """
         self._buffer.clear()
-        self._last_good = None

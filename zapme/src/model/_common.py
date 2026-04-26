@@ -14,9 +14,58 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import onnxruntime as ort
+import pandas as pd
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
+
+
+def clean_feature_window(window: np.ndarray, time_axis: int = 0) -> np.ndarray:
+    """Fill NaN entries in a feature window via ffill / bfill / zero-fill.
+
+    Single source of truth for the NaN policy used by both the training
+    pipeline (which builds windows offline from per-frame parquets) and
+    the runtime feature buffer (which builds windows online from live
+    camera frames). Keeping the cleaner here ensures the classifier
+    sees the same input distribution at inference time as during
+    training: per-feature, forward-fill from the most recent non-NaN,
+    then backward-fill any leading NaN, then zero-fill any feature
+    that was never observed across the entire window.
+
+    Args:
+        window: 2D float array. Layout is set by `time_axis`:
+            `time_axis=0` for time-major `(T, F)` (training pipeline);
+            `time_axis=1` for feature-major `(F, T)` (runtime buffer).
+        time_axis: `0` if `window.shape == (T, F)`, `1` if it is
+            `(F, T)`.
+
+    Returns:
+        A fresh array of the same shape as `window`, with no NaN values.
+
+    Raises:
+        ValueError: If `time_axis` is not `0` or `1`.
+
+    Preconditions:
+        - `window` is a 2D array of `float`-castable values.
+
+    Postconditions:
+        - Output contains no NaN values.
+        - Input `window` is not mutated.
+    """
+    if time_axis not in (0, 1):
+        raise ValueError(f"time_axis must be 0 or 1, got {time_axis}")
+    if time_axis == 1:
+        return clean_feature_window(window.T, time_axis=0).T
+
+    out = window.copy()
+    for col in range(out.shape[1]):
+        series = pd.Series(out[:, col])
+        series = series.ffill().bfill()
+        if series.isna().all():
+            series = series.fillna(0.0)
+        out[:, col] = series.to_numpy()
+    return out
 
 
 def download_from_hf(
