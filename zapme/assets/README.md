@@ -18,6 +18,23 @@ without breaking the loop:
 worker, so the second clip starts the moment the first subprocess
 exits — no overlap, no blocking the inference loop.
 
+### Variants (multiple takes for one clip)
+
+For any clip name, drop in additional files matching `<name>*.mp3`
+and the runtime will pick one at random per play. Example:
+
+```
+zapscream.mp3
+zapscream2.mp3
+zapscream3.mp3
+```
+
+… and `play("zapscream")` chooses one of the three uniformly each
+zap. This works for any clip: `firstwarn2.mp3`, `bootup_alt.mp3`,
+etc. Variant discovery happens at startup; the runtime logs which
+clips have multiple variants on boot. To go back to a single take,
+delete the extra files.
+
 Format: MP3. The platform binary used is:
 
 - Linux (Pi): `mpg123 -q` — `sudo apt install -y mpg123`

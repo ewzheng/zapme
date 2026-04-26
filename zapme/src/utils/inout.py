@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import random
 import subprocess
 import sys
 import threading
@@ -274,28 +275,67 @@ class FileSpeaker(Speaker):
 
     def __init__(
         self,
-        clips: dict[str, Path],
+        clips: dict[str, Path | list[Path]],
         logger: logging.Logger | None = None,
     ) -> None:
-        """Build a speaker around a clip-name → file mapping.
+        """Build a speaker around a clip-name → file(s) mapping.
 
         Args:
-            clips: Map from logical clip name (e.g. `"warning_1"`)
-                to the WAV file path that should play. Missing files
-                are tolerated at `play()` time, not at construction.
+            clips: Map from logical clip name (e.g. `"zapscream"`)
+                to the audio file path that should play, OR to a
+                list of paths from which one is picked at random on
+                each call (for clip variants — e.g. multiple zap
+                scream takes so the user doesn't always hear the
+                same one). Missing files are tolerated at `play()`
+                time, not at construction.
             logger: Optional logger for diagnostic messages.
 
         Preconditions:
-            - All values in `clips` are `Path`-like.
+            - Each value in `clips` is either a single `Path`-like
+              or a list of `Path`-likes.
 
         Postconditions:
             - The speaker is ready to accept `play()` calls.
             - No subprocesses have been spawned yet.
         """
-        self._clips = {name: Path(p) for name, p in clips.items()}
+        normalized: dict[str, Path | list[Path]] = {}
+        for name, value in clips.items():
+            if isinstance(value, (list, tuple)):
+                paths = [Path(p) for p in value]
+                normalized[name] = paths[0] if len(paths) == 1 else paths
+            else:
+                normalized[name] = Path(value)
+        self._clips = normalized
         self._logger = logger or logging.getLogger(__name__)
         self._procs: list[subprocess.Popen[bytes]] = []
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _pick_path(
+        clip_value: Path | list[Path],
+        rng: random.Random | None = None,
+    ) -> Path:
+        """Resolve a clip value to a single `Path`, picking randomly if a list.
+
+        Args:
+            clip_value: A single `Path` or a non-empty list of `Path`s.
+            rng: Optional `random.Random` for deterministic picks
+                in tests. Defaults to the module-level random state.
+
+        Returns:
+            The chosen `Path`.
+
+        Preconditions:
+            - When `clip_value` is a list, it is non-empty.
+
+        Postconditions:
+            - For a single `Path`, the same `Path` is always returned.
+            - For a list, the choice is uniformly random over the list.
+        """
+        if isinstance(clip_value, list):
+            chooser = rng or random
+            return chooser.choice(clip_value)
+        return clip_value
 
     def play(self, clip_name: str) -> None:
         """Spawn the platform audio command on the requested clip.
@@ -436,10 +476,16 @@ class FileSpeaker(Speaker):
               and is running.
             - On failure: a warning has been logged.
         """
-        path = self._clips.get(clip_name)
-        if path is None:
+        clip_value = self._clips.get(clip_name)
+        if clip_value is None:
             self._logger.warning("Speaker: unknown clip name '%s'", clip_name)
             return None
+        if isinstance(clip_value, list) and not clip_value:
+            self._logger.warning(
+                "Speaker: clip '%s' has no variants registered", clip_name
+            )
+            return None
+        path = self._pick_path(clip_value)
         if not path.exists():
             self._logger.warning("Speaker: clip file missing: %s", path)
             return None

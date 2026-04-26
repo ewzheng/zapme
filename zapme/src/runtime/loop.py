@@ -492,13 +492,22 @@ class EscalationConfig:
             before the pulse is allowed.
         fire_to_warn_s: After a FIRE is emitted, the escalator stays
             silent for this many seconds before the warning ladder
-            restarts. Only used when the debouncer remains active —
-            a release at any point still resets immediately.
+            restarts.
+        release_grace_s: How long a release (`debounce_active=False`)
+            is tolerated before the escalator collapses back to IDLE.
+            During the grace window, the state's countdown is paused;
+            re-engaging resumes timing where it left off, so brief
+            posture corrections don't restart the warning ladder
+            from WARN_1. A release that lasts longer than this fully
+            resets state. Default 30s — about 3x the typical
+            warn_to_warn delay, long enough that "I sat back for a
+            second" doesn't punish you with a fresh ladder.
     """
 
     warn_to_warn_s: float = 10.0
     warn_to_fire_s: float = 10.0
     fire_to_warn_s: float = 10.0
+    release_grace_s: float = 30.0
 
 
 class EscalationAction(enum.IntEnum):
@@ -561,9 +570,20 @@ class WarningEscalator:
                 f"warn_to_fire={cfg.warn_to_fire_s}s, "
                 f"fire_to_warn={cfg.fire_to_warn_s}s"
             )
+        if cfg.release_grace_s < 0:
+            raise ValueError(
+                f"release_grace_s must be >= 0, got {cfg.release_grace_s}"
+            )
         self._cfg = cfg
         self._state = self._State.IDLE
         self._state_entered_at = 0.0
+        # When non-None, marks the perf_counter() reading at which
+        # the debouncer first went inactive in the current release
+        # window. Used to (a) decide if release_grace_s has elapsed
+        # and (b) shift `_state_entered_at` forward when the user
+        # re-engages, so the inter-step countdown effectively pauses
+        # during the grace.
+        self._released_at: float | None = None
 
     def step(
         self, debounce_active: bool, audio_busy: bool = False,
@@ -605,9 +625,33 @@ class WarningEscalator:
         """
         now = time.perf_counter()
         if not debounce_active:
-            self._state = self._State.IDLE
-            self._state_entered_at = now
+            # Release: don't drop the ladder immediately. Mark the
+            # release time on the leading edge and only fully reset
+            # to IDLE if the user stays released past the grace
+            # window. Within the grace, state is preserved and the
+            # countdown is effectively paused (resume logic below
+            # shifts `_state_entered_at` forward by the release
+            # duration when the user re-engages). With
+            # `release_grace_s == 0`, the second condition fires on
+            # the same frame as the first and we collapse to the
+            # old "release immediately resets" behavior.
+            if self._released_at is None:
+                self._released_at = now
+            if now - self._released_at >= self._cfg.release_grace_s:
+                self._state = self._State.IDLE
+                self._state_entered_at = now
+                self._released_at = None
             return EscalationAction.NONE
+
+        # debounce_active = True
+        if self._released_at is not None:
+            # The user re-engaged within the grace. Slide
+            # `_state_entered_at` forward by the release duration so
+            # `now - _state_entered_at` ignores the time spent
+            # released. Net effect: the inter-step countdown picks
+            # up where it paused.
+            self._state_entered_at += now - self._released_at
+            self._released_at = None
 
         if audio_busy:
             # Hold the inter-step countdown at zero while a previous
@@ -653,16 +697,18 @@ class WarningEscalator:
             return EscalationAction.NONE
 
     def reset(self) -> None:
-        """Force the state machine back to idle.
+        """Force the state machine back to idle, clearing release tracking.
 
         Preconditions:
             - `__init__` completed.
 
         Postconditions:
             - The next `step(True)` returns `WARN_1`.
+            - Any in-flight release-grace tracking is discarded.
         """
         self._state = self._State.IDLE
         self._state_entered_at = 0.0
+        self._released_at = None
 
 
 def open_camera(index: int) -> LatestFrameCamera:

@@ -142,6 +142,17 @@ def parse_args() -> argparse.Namespace:
              "nagged. The pulser cooldown still gates the physical zap.",
     )
     parser.add_argument(
+        "--release-grace", type=float, default=30.0,
+        help="Seconds of release (sat-up-straight) the escalator "
+             "tolerates before resetting the warning ladder back to "
+             "WARN_1. During this window the inter-step countdown is "
+             "paused and re-engaging picks up where it left off, so "
+             "brief posture corrections don't earn the user a fresh "
+             "ladder. Default 30s — long enough to cover 'I sat back "
+             "for a moment to grab water'. Set to 0 for the old "
+             "instant-reset behavior.",
+    )
+    parser.add_argument(
         "--no-audio", action="store_true",
         help="Disable spoken warnings — uses an in-memory FakeSpeaker so the "
              "loop still runs the warning state machine but no sound plays. "
@@ -195,6 +206,50 @@ def _resolve_backend(requested: str | None) -> str:
     if sys.platform.startswith("linux"):
         return "lgpio"
     return "fake"
+
+
+def _build_clip_map(
+    assets_dir: Path, log: logging.Logger,
+) -> dict[str, Path | list[Path]]:
+    """Resolve each `DEFAULT_CLIPS` entry to a path or list of variant paths.
+
+    For each logical clip name, glob `<name>*{DEFAULT_CLIP_EXT}` in
+    `assets_dir`. Multiple matches register as a list (the speaker
+    randomizes per call), a single match registers as a `Path`, no
+    matches register the canonical path so `FileSpeaker` can log a
+    "missing file" warning at play time.
+
+    Args:
+        assets_dir: Directory containing voice clip files.
+        log: Logger for variant-discovery diagnostics.
+
+    Returns:
+        Mapping suitable for `FileSpeaker(clips=...)`.
+
+    Preconditions:
+        - `assets_dir` is a `Path` (may or may not exist).
+
+    Postconditions:
+        - The returned dict has a value for every name in
+          `DEFAULT_CLIPS`.
+        - List values are sorted by filename for deterministic
+          enumeration; the *choice* among them at play time is
+          random.
+    """
+    clip_map: dict[str, Path | list[Path]] = {}
+    for name in DEFAULT_CLIPS:
+        variants = sorted(assets_dir.glob(f"{name}*{DEFAULT_CLIP_EXT}"))
+        if len(variants) == 0:
+            clip_map[name] = assets_dir / f"{name}{DEFAULT_CLIP_EXT}"
+        elif len(variants) == 1:
+            clip_map[name] = variants[0]
+        else:
+            clip_map[name] = variants
+            log.info(
+                "Audio: clip '%s' has %d variants (%s); will randomize per play.",
+                name, len(variants), ", ".join(p.name for p in variants),
+            )
+    return clip_map
 
 
 def _build_gate(backend: str, pin: int, active_high: bool) -> Gate:
@@ -280,6 +335,7 @@ def main() -> int:
             warn_to_warn_s=args.warn_to_warn,
             warn_to_fire_s=args.warn_to_fire,
             fire_to_warn_s=args.fire_to_warn,
+            release_grace_s=args.release_grace,
         )
     )
     pulser = Pulser(config=PulserConfig(cooldown_s=args.cooldown))
@@ -294,10 +350,7 @@ def main() -> int:
         speaker = FakeSpeaker()
         log.info("Audio disabled (--no-audio); warnings will not play out loud.")
     else:
-        clip_map = {
-            name: args.assets_dir / f"{name}{DEFAULT_CLIP_EXT}"
-            for name in DEFAULT_CLIPS
-        }
+        clip_map = _build_clip_map(args.assets_dir, log)
         speaker = FileSpeaker(clips=clip_map, logger=log.getChild("speaker"))
         log.info("Audio assets dir: %s", args.assets_dir)
         speaker.play("bootup")

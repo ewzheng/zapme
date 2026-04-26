@@ -22,13 +22,20 @@ def _make(
     warn_to_warn: float = 0.1,
     warn_to_fire: float = 0.1,
     fire_to_warn: float = 0.1,
+    release_grace: float = 0.0,
 ) -> WarningEscalator:
-    """Build an escalator with deliberately short delays for fast tests."""
+    """Build an escalator with deliberately short delays for fast tests.
+
+    `release_grace` defaults to `0.0` so existing tests retain the
+    pre-grace "release immediately resets to IDLE" semantics. Tests
+    of the grace behavior pass an explicit non-zero value.
+    """
     return WarningEscalator(
         EscalationConfig(
             warn_to_warn_s=warn_to_warn,
             warn_to_fire_s=warn_to_fire,
             fire_to_warn_s=fire_to_warn,
+            release_grace_s=release_grace,
         )
     )
 
@@ -176,6 +183,57 @@ def test_audio_busy_does_not_block_release_reset() -> None:
     e.step(False, audio_busy=True)  # release should still reset
     # Next active step starts a new ladder from WARN_1.
     assert e.step(True) == EscalationAction.WARN_1
+
+
+def test_release_within_grace_preserves_state() -> None:
+    """A brief release within `release_grace_s` keeps the ladder."""
+    e = _make(warn_to_warn=0.2, release_grace=1.0)
+    assert e.step(True) == EscalationAction.WARN_1
+    # Release for 50ms (well within 1s grace).
+    e.step(False)
+    time.sleep(0.05)
+    e.step(False)
+    # Re-engage. State should still be WAIT_WARN_2; not WARN_1 again.
+    assert e.step(True) == EscalationAction.NONE
+    # After warn_to_warn elapses (timer was paused during release),
+    # WARN_2 fires.
+    time.sleep(0.25)
+    assert e.step(True) == EscalationAction.WARN_2
+
+
+def test_release_beyond_grace_resets_to_idle() -> None:
+    """A release longer than `release_grace_s` does fully reset."""
+    e = _make(warn_to_warn=0.2, release_grace=0.05)
+    assert e.step(True) == EscalationAction.WARN_1
+    # Release past the grace window.
+    e.step(False)
+    time.sleep(0.1)
+    e.step(False)  # second tick now exceeds grace → reset
+    # Re-engage. State is IDLE → WARN_1 fires fresh.
+    assert e.step(True) == EscalationAction.WARN_1
+
+
+def test_release_grace_pauses_timer() -> None:
+    """Time spent released doesn't count toward `warn_to_warn_s`."""
+    e = _make(warn_to_warn=0.2, release_grace=2.0)
+    assert e.step(True) == EscalationAction.WARN_1
+    # Spend 100ms slouched (half the warn_to_warn window).
+    time.sleep(0.1)
+    # Release for 200ms — without the pause this would still be
+    # under 0.2s of "active time", so WARN_2 should NOT fire yet.
+    e.step(False)
+    time.sleep(0.2)
+    # Re-engage. Active time is still 100ms; need another 100ms.
+    assert e.step(True) == EscalationAction.NONE
+    time.sleep(0.15)
+    # Now total active time exceeds warn_to_warn → WARN_2.
+    assert e.step(True) == EscalationAction.WARN_2
+
+
+def test_negative_grace_rejected() -> None:
+    """Negative `release_grace_s` rejects construction."""
+    with pytest.raises(ValueError, match="release_grace_s"):
+        WarningEscalator(EscalationConfig(release_grace_s=-1.0))
 
 
 def test_negative_delay_rejected() -> None:

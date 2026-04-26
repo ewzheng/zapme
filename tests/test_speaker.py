@@ -110,3 +110,35 @@ def test_file_speaker_missing_file_does_not_raise(tmp_path) -> None:
     spk = FileSpeaker(clips={"hello": tmp_path / "missing.wav"})
     spk.play("hello")
     spk.close()
+
+
+def test_pick_path_single_path_returns_same_path(tmp_path) -> None:
+    """A non-list value is returned verbatim."""
+    p = tmp_path / "only.mp3"
+    assert FileSpeaker._pick_path(p) is p
+
+
+def test_pick_path_list_uses_random_choice(tmp_path) -> None:
+    """A list is sampled via the supplied RNG."""
+    import random as _rand
+    paths = [tmp_path / f"v{i}.mp3" for i in range(5)]
+    rng = _rand.Random(42)
+    seen = {FileSpeaker._pick_path(paths, rng=rng) for _ in range(50)}
+    # All five variants should appear with seed 42 over 50 picks.
+    assert seen == set(paths)
+
+
+def test_file_speaker_normalizes_single_item_list(tmp_path) -> None:
+    """A list of one path collapses to that path internally."""
+    p = tmp_path / "only.mp3"
+    spk = FileSpeaker(clips={"clip": [p]})
+    assert spk._clips["clip"] == p
+    spk.close()
+
+
+def test_file_speaker_keeps_multi_variant_list(tmp_path) -> None:
+    """A list of two+ paths is preserved as a list (for randomization)."""
+    paths = [tmp_path / "a.mp3", tmp_path / "b.mp3"]
+    spk = FileSpeaker(clips={"clip": paths})
+    assert spk._clips["clip"] == paths
+    spk.close()
