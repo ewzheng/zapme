@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -328,16 +329,45 @@ class Pulser:
         self._prev_active = False
 
 
+def _pick_capture_backend() -> int:
+    """Pick the OpenCV capture backend best suited to the host platform.
+
+    Returns:
+        A `cv2.CAP_*` constant suitable for `cv2.VideoCapture(index, backend)`.
+
+    Preconditions:
+        - `cv2` was built with the relevant backend support (true for
+          all standard PyPI wheels).
+
+    Postconditions:
+        - Returns `cv2.CAP_DSHOW` on Windows (DirectShow), `cv2.CAP_V4L2`
+          on Linux (Video4Linux2), or `cv2.CAP_ANY` on macOS / other.
+        - Does not open any device.
+    """
+    if sys.platform == "win32":
+        return cv2.CAP_DSHOW
+    if sys.platform.startswith("linux"):
+        return cv2.CAP_V4L2
+    return cv2.CAP_ANY
+
+
 def open_camera(index: int) -> cv2.VideoCapture:
-    """Open a webcam by OpenCV index.
+    """Open a webcam by OpenCV index, with low-latency settings applied.
+
+    Forces `CAP_PROP_BUFFERSIZE = 1` so `cap.read()` always returns the
+    most recent frame — without this, the driver queues frames and a
+    slow consumer ends up reading frames that are seconds out of date.
+    Also pins the platform-native capture backend (DirectShow on
+    Windows, V4L2 on Linux) which avoids the OpenCV default-backend
+    fallback dance.
 
     Args:
         index: OpenCV camera index. `0` is the first camera the
             platform reports (usually the built-in laptop webcam).
 
     Returns:
-        An opened `cv2.VideoCapture`. The caller owns it and must
-        `.release()` when done.
+        An opened `cv2.VideoCapture` with low-latency settings. The
+        caller owns it and must `.release()` when done.
 
     Raises:
         RuntimeError: If the camera cannot be opened.
@@ -347,10 +377,14 @@ def open_camera(index: int) -> cv2.VideoCapture:
 
     Postconditions:
         - The returned capture has `isOpened()` true.
+        - `CAP_PROP_BUFFERSIZE = 1` has been requested (drivers may
+          ignore the hint, but on common Pi / Windows webcams it
+          takes effect).
     """
-    cap = cv2.VideoCapture(index)
+    cap = cv2.VideoCapture(index, _pick_capture_backend())
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open camera index {index}")
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
 
 
