@@ -1,65 +1,64 @@
-# Systemd unit for zapme — vision-driven posture corrector.
+# Systemd user-level unit for zapme — vision-driven posture corrector.
 #
-# Boots the runtime loop automatically on Pi power-on. Combined with a
-# physical power switch on the box, this gives the operator a single
-# physical gesture to start / stop the whole system: flip the switch
-# on, the Pi boots and zapme starts; flip it off, everything dies.
+# Boots the runtime loop automatically when the Pi powers on.
+# Combined with `loginctl enable-linger` (set automatically by the
+# install script), the user's session — and therefore this service —
+# starts at boot before anyone has to log in.
 #
-# Repo install location: /opt/zapme (fixed). Only `User=` is per-machine
-# and gets substituted at install time. See `scripts/install_systemd.sh`
-# for the full one-shot install, or run the steps manually:
+# Why user-level instead of system-level:
+#   - Audio (PipeWire / PulseAudio / ALSA fallback) runs inside the
+#     user session. A system-level service has no audio context at
+#     boot.
+#   - Group membership (gpio / audio / video) is automatic — the
+#     service runs as the user and inherits all their groups.
+#   - No __USER__ template substitution: user services are owned by
+#     whichever user installs them.
 #
-#   sudo mkdir -p /opt/zapme && sudo chown -R $USER:$USER /opt/zapme
-#   git clone <repo-url> /opt/zapme       # or `mv ~/zapme /opt/zapme`
-#   cd /opt/zapme
-#   sudo apt install -y mpg123 python3-lgpio
-#   python3 -m venv .venv --system-site-packages
-#   .venv/bin/pip install -e .[pi]
+# Install (renders nothing — just copies into the user's systemd dir):
 #
-#   sed "s|__USER__|$USER|g" scripts/zapme.service \
-#     | sudo tee /etc/systemd/system/zapme.service > /dev/null
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable  zapme.service      # auto-start on boot
-#   sudo systemctl start   zapme.service      # start now
-#   sudo systemctl status  zapme.service      # check
-#   journalctl -u zapme.service -f            # live logs
+#   sudo bash scripts/install_systemd.sh
+#
+# That script also calls `loginctl enable-linger`, which is what
+# makes the service start at boot without a login.
+#
+# Manual control after install:
+#
+#   systemctl --user status  zapme.service
+#   systemctl --user restart zapme.service
+#   journalctl --user -u zapme.service -f
 #
 # Stop / disable / uninstall:
 #
-#   sudo systemctl stop    zapme.service
-#   sudo systemctl disable zapme.service
-#   sudo rm /etc/systemd/system/zapme.service
-#   sudo systemctl daemon-reload
+#   systemctl --user stop    zapme.service
+#   systemctl --user disable zapme.service
+#   rm ~/.config/systemd/user/zapme.service
+#   systemctl --user daemon-reload
+#   sudo loginctl disable-linger $USER     # if you don't want the
+#                                          # user session at boot anymore
 #
 # Edit GPIO pin, camera index, thresholds etc. directly in the
 # ExecStart= block below if they differ from the defaults.
 
 [Unit]
 Description=Zapme posture corrector
-# Wait for udev so /dev/video* and /dev/gpiochip* are populated
-After=systemd-udev-settle.service
-Wants=systemd-udev-settle.service
+# default.target is the user-session equivalent of multi-user.target.
+After=default.target
+# Explicit dependency on the audio stack so we don't race PipeWire /
+# WirePlumber at boot. Without these, on Pi OS Trixie the service
+# can start before the audio socket exists and silently no-op all
+# the .play() calls. install_systemd.sh enables these user units
+# alongside zapme so they actually exist to depend on.
+Wants=pipewire.service pipewire-pulse.service wireplumber.service
+After=pipewire.service pipewire-pulse.service wireplumber.service
 
 [Service]
 Type=simple
-User=__USER__
-Group=gpio
 WorkingDirectory=/opt/zapme
 
 # Force unbuffered stdout/stderr so journalctl shows logs in real time
 Environment=PYTHONUNBUFFERED=1
 
-# Audio routing for the system-level service. Pi OS Bookworm uses
-# PipeWire / PulseAudio, which lives in the user's runtime directory
-# at /run/user/<UID>. %U expands to the User=__USER__'s UID.
-# REQUIRES `sudo loginctl enable-linger __USER__` to be run once so
-# the user session (and therefore /run/user/%U) exists at boot before
-# anyone logs in.
-Environment=XDG_RUNTIME_DIR=/run/user/%U
-Environment=PULSE_RUNTIME_PATH=/run/user/%U/pulse
-
-# Use the venv's Python so the service does not depend on system Python
-# being correctly configured. The venv must be created with
+# Use the venv's Python directly. The venv must be created with
 # `--system-site-packages` so it can see the apt-installed lgpio.
 ExecStart=/opt/zapme/.venv/bin/python -m zapme.src \
     --backend lgpio \
@@ -97,4 +96,4 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

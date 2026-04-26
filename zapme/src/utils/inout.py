@@ -559,7 +559,16 @@ class FileSpeaker(Speaker):
         is_mp3 = path.suffix.lower() == ".mp3"
         if sys.platform.startswith("linux"):
             if is_mp3:
-                return ["mpg123", "-q", str(path)]
+                # `-o alsa` pins playback to the kernel ALSA driver
+                # rather than letting mpg123 auto-detect (which on
+                # Pi OS Bookworm/Trixie defaults to PulseAudio /
+                # PipeWire — both of which live in the user session
+                # and therefore aren't available to a system-level
+                # systemd service at boot before any user logs in).
+                # Going straight to ALSA means the only requirement
+                # is that the runtime user is in the `audio` group,
+                # which lets it open /dev/snd/* directly.
+                return ["mpg123", "-q", "-o", "alsa", str(path)]
             return ["aplay", "-q", str(path)]
         if sys.platform == "darwin":
             return ["afplay", str(path)]
