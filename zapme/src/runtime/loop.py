@@ -769,6 +769,11 @@ class Loop:
         self._log_interval_s = log_interval_s
         self._missing_pose_reset_frames = missing_pose_reset_frames
         self._missing_pose_count = 0
+        # Deferred-pulse signal: set by the zap-sequence worker after
+        # `zapwarn` finishes, consumed by the next loop iteration so
+        # the gate fires only after the spoken warning has played.
+        self._zap_lock = threading.Lock()
+        self._zap_pending = False
         self._logger = logger or logging.getLogger(__name__)
 
     def run(self) -> int:
@@ -792,6 +797,8 @@ class Loop:
         self._escalator.reset()
         self._pulser.reset()
         self._missing_pose_count = 0
+        with self._zap_lock:
+            self._zap_pending = False
         self._warmup()
         last_log = 0.0
         try:
@@ -831,18 +838,28 @@ class Loop:
                 action = self._escalator.step(debounce_active)
                 if action == EscalationAction.WARN_1:
                     self._logger.warning("Escalator: warning 1 (prob=%.2f)", prob)
-                    self._speaker.play("warning_1")
+                    self._speaker.play("firstwarn")
                 elif action == EscalationAction.WARN_2:
                     self._logger.warning("Escalator: warning 2 (prob=%.2f)", prob)
-                    self._speaker.play("warning_2")
-                pulse = self._pulser.step(action == EscalationAction.FIRE)
+                    self._speaker.play("finalwarn")
+                elif action == EscalationAction.FIRE:
+                    self._logger.warning(
+                        "Escalator: FIRE armed (prob=%.2f); pulse will follow zapwarn audio",
+                        prob,
+                    )
+                    self._spawn_zap_sequence()
+                # The pulser sees True only on the frame after the
+                # zap-sequence worker finishes the spoken warning —
+                # never on the escalator's FIRE frame directly. This
+                # is what gives the audio a chance to play before the
+                # gate goes hot.
+                pulse = self._pulser.step(self._consume_zap_pending())
                 if pulse:
                     self._logger.warning(
                         "Pulse fired (prob=%.2f); cooldown=%.1fs",
                         prob,
                         self._pulser.cooldown_remaining_s(),
                     )
-                    self._speaker.play("zap")
                 self._watchdog.set_active(pulse)
                 self._watchdog.heartbeat()
 
@@ -876,6 +893,60 @@ class Loop:
             self._pulser.reset()
 
         return 1 if self._watchdog.is_tripped() else 0
+
+    def _spawn_zap_sequence(self) -> None:
+        """Start the audio-gated zap: zapwarn → arm pulse → zapscream.
+
+        Runs on a daemon thread so the inference loop is never blocked
+        by audio playback. The thread plays `zapwarn` to completion,
+        sets `_zap_pending` so the next loop iteration asserts the
+        gate, then plays `zapscream` (which overlaps with the actual
+        EMS pulse).
+
+        Preconditions:
+            - `__init__` completed.
+
+        Postconditions:
+            - A daemon thread has been started.
+            - `_zap_pending` will be set to True once `zapwarn`
+              finishes (or immediately if the clip is unavailable).
+        """
+        def _run() -> None:
+            try:
+                self._speaker.play_blocking("zapwarn")
+            finally:
+                # Even if zapwarn errored or was missing, still arm
+                # the pulse — the escalator already decided to fire,
+                # and we don't want a missing audio asset to suppress
+                # safety behavior.
+                with self._zap_lock:
+                    self._zap_pending = True
+                try:
+                    self._speaker.play("zapscream")
+                except Exception:
+                    self._logger.exception("Speaker: zapscream play failed")
+
+        threading.Thread(
+            target=_run, daemon=True, name="zapme-zap-sequence"
+        ).start()
+
+    def _consume_zap_pending(self) -> bool:
+        """Atomically read-and-clear the deferred-pulse flag.
+
+        Returns:
+            `True` if the zap-sequence worker signalled a pending
+            pulse since the last call; `False` otherwise.
+
+        Preconditions:
+            - `__init__` completed.
+
+        Postconditions:
+            - `_zap_pending` is False on return.
+        """
+        with self._zap_lock:
+            pending = self._zap_pending
+            self._zap_pending = False
+        return pending
 
     def _warmup(self) -> None:
         """Run one dummy inference to amortize first-frame JIT / allocator costs.

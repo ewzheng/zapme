@@ -39,8 +39,9 @@ from zapme.src.runtime.loop import (
 from zapme.src.runtime.watchdog import Watchdog
 from zapme.src.utils.inout import FakeSpeaker, FileSpeaker, Speaker
 
-DEFAULT_ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets"
-DEFAULT_CLIPS = ("warning_1", "warning_2", "zap")
+DEFAULT_ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
+DEFAULT_CLIPS = ("bootup", "firstwarn", "finalwarn", "zapwarn", "zapscream")
+DEFAULT_CLIP_EXT = ".mp3"
 
 
 def parse_args() -> argparse.Namespace:
@@ -280,9 +281,13 @@ def main() -> int:
         speaker = FakeSpeaker()
         log.info("Audio disabled (--no-audio); warnings will not play out loud.")
     else:
-        clip_map = {name: args.assets_dir / f"{name}.wav" for name in DEFAULT_CLIPS}
+        clip_map = {
+            name: args.assets_dir / f"{name}{DEFAULT_CLIP_EXT}"
+            for name in DEFAULT_CLIPS
+        }
         speaker = FileSpeaker(clips=clip_map, logger=log.getChild("speaker"))
         log.info("Audio assets dir: %s", args.assets_dir)
+        speaker.play("bootup")
 
     gate = _build_gate(
         backend=backend,
