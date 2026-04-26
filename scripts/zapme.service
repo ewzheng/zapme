@@ -42,6 +42,12 @@ ExecStart=/home/pi/zapme/.venv/bin/python -m zapme.src \
     --cooldown 15 \
     --on-threshold 0.8 \
     --off-threshold 0.4
+# Polarity defaults to active-LOW (line LOW = relay ON, HIGH at boot
+# = de-energized). If you ever swap to a relay that's wired the other
+# way (active-HIGH), append `--gate-active-high`. Verify with:
+#   .venv/bin/python -m zapme.src.utils.tens_control --pulse 0.5
+# A clean silent→click→silent (with EMS pads unplugged) confirms the
+# default is correct.
 
 # Restart only on non-zero exit (watchdog trip → exit 1). Don't restart
 # on clean exit (operator pressed Ctrl-C, exit 0).

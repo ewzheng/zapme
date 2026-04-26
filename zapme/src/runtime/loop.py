@@ -800,6 +800,13 @@ class Loop:
         with self._zap_lock:
             self._zap_pending = False
         self._warmup()
+        # Block until any startup audio (e.g. the bootup announcement)
+        # has finished playing. The inference loop must not arm the
+        # gate while bootup is still audible — operator hasn't even
+        # heard the system come up yet.
+        self._logger.info("Waiting for any in-flight audio to finish before going hot...")
+        self._speaker.wait_until_idle()
+        self._logger.info("Speaker idle; entering inference loop.")
         last_log = 0.0
         try:
             self._watchdog.start()

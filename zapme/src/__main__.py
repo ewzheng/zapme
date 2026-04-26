@@ -95,8 +95,11 @@ def parse_args() -> argparse.Namespace:
         help="BCM GPIO pin for LgpioGate.",
     )
     parser.add_argument(
-        "--gate-active-low", action="store_true",
-        help="Treat low as the active level (for inverted-logic gating).",
+        "--gate-active-high", action="store_true",
+        help="Override the default active-LOW polarity. Pass this only "
+             "if your relay asserts on a HIGH line level — the default "
+             "matches the active-LOW opto-relay in the deployed box "
+             "(line HIGH at boot keeps the EMS de-energized).",
     )
 
     parser.add_argument("--on-threshold", type=float, default=0.8)
@@ -292,7 +295,7 @@ def main() -> int:
     gate = _build_gate(
         backend=backend,
         pin=args.gate_pin,
-        active_high=not args.gate_active_low,
+        active_high=args.gate_active_high,
     )
 
     watchdog = Watchdog(

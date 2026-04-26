@@ -210,7 +210,7 @@ def cli() -> int:
     # self-test uses the same wiring as the loop will.
     pin_parser = argparse.ArgumentParser(add_help=False)
     pin_parser.add_argument("--gate-pin", type=int, default=DEFAULT_TENS_PIN)
-    pin_parser.add_argument("--gate-active-low", action="store_true")
+    pin_parser.add_argument("--gate-active-high", action="store_true")
     pin_args, _ = pin_parser.parse_known_args(forwarded)
 
     logging.basicConfig(
@@ -221,7 +221,7 @@ def cli() -> int:
     if not wrapper_args.no_self_test:
         rc = _self_test(
             pin=pin_args.gate_pin,
-            active_high=not pin_args.gate_active_low,
+            active_high=pin_args.gate_active_high,
             duration_s=wrapper_args.pulse_test,
         )
         if rc != 0:

@@ -239,15 +239,18 @@ class LgpioGate(Gate):
     never sources the EMS current itself.
     """
 
-    def __init__(self, pin: int, active_high: bool = True, chip: int = 0) -> None:
-        """Claim the requested GPIO pin and drive it low.
+    def __init__(self, pin: int, active_high: bool = False, chip: int = 0) -> None:
+        """Claim the requested GPIO pin and drive it to its inactive level.
 
         Args:
             pin: BCM pin number to drive.
-            active_high: When `True` (the default), `set(True)` writes
-                `1` to the line. When `False`, `set(True)` writes `0`
-                — useful when the gating circuit is wired with inverted
-                logic (e.g., a PNP transistor).
+            active_high: When `True`, `set(True)` writes `1` to the
+                line and the pin sits LOW when inactive. When `False`
+                (the default — matches the deployment's opto-isolated
+                relay), `set(True)` writes `0` and the pin sits HIGH
+                when inactive. The default exists because the relay
+                in the box is active-LOW: driving the line HIGH at
+                claim-time keeps the EMS de-energized at boot.
             chip: GPIO chip index. `0` is the only chip on a Pi 4 (the
                 BCM2711). Pi 5 has multiple chips; the one carrying the
                 40-pin header is also `0`.

@@ -26,8 +26,14 @@ dependencies = [
 # Install on the Pi: pip install -e .[pi]
 # Only resolves on Linux aarch64 (Raspberry Pi OS 64-bit).
 pi = [
-  "lgpio;     sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "gpiozero;  sys_platform == 'linux' and platform_machine == 'aarch64'",
+  # gpiozero is pure Python and pip-installs cleanly. lgpio is NOT
+  # listed here on purpose: on Raspberry Pi OS Bookworm, pip falls
+  # back to building lgpio from source (needs SWIG + a multiarch gcc
+  # symlink that's often missing even with build-essential). The
+  # supported path is `sudo apt install -y python3-lgpio` and a venv
+  # created with `--system-site-packages` so the venv can see the
+  # apt-installed binding. See README / live_test.py docstrings.
+  "gpiozero;  sys_platform == 'linux'",
 ]
 
 # Install on a desktop / HPC for training: pip install -e .[train]

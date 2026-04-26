@@ -71,7 +71,7 @@ class TensController(Gate):
     def open_pi(
         cls,
         pin: int = DEFAULT_TENS_PIN,
-        active_high: bool = True,
+        active_high: bool = False,
     ) -> "TensController":
         """Open a controller backed by a real `LgpioGate` on the Pi.
 
@@ -79,7 +79,9 @@ class TensController(Gate):
             pin: BCM GPIO pin wired to the TENS relay's trigger input.
                 Defaults to the same pin the original team script used.
             active_high: `True` when the wiring drives the relay on
-                with a HIGH level (typical NPN-transistor setup).
+                with a HIGH level. Default `False` matches the
+                deployment's active-LOW opto-isolated relay (line LOW
+                = relay ON, line HIGH at boot = safely de-energized).
 
         Returns:
             A `TensController` ready to drive real hardware.
@@ -330,7 +332,12 @@ def main(argv: list[str] | None = None) -> int:
         "--backend", choices=("lgpio", "fake"), default=_resolve_default_backend(),
     )
     parser.add_argument("--pin", type=int, default=DEFAULT_TENS_PIN)
-    parser.add_argument("--active-low", action="store_true")
+    parser.add_argument(
+        "--active-high", action="store_true",
+        help="Override the default active-LOW polarity. Pass this only "
+             "if your relay asserts on a HIGH line level — the default "
+             "matches the active-LOW opto-relay in the deployed box.",
+    )
     parser.add_argument(
         "--pulse", type=float, default=None,
         help="Fire a single pulse for this many seconds.",
@@ -358,14 +365,14 @@ def main(argv: list[str] | None = None) -> int:
     log.info(
         "Opening TENS on BCM %d (active_%s, backend=%s).",
         args.pin,
-        "low" if args.active_low else "high",
+        "high" if args.active_high else "low",
         args.backend,
     )
     try:
         with _build_controller(
             backend=args.backend,
             pin=args.pin,
-            active_high=not args.active_low,
+            active_high=args.active_high,
         ) as ctrl:
             log.info("Pulsing for %.2fs", duration)
             ctrl.pulse(duration)

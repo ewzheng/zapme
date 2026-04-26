@@ -117,6 +117,25 @@ class Speaker(abc.ABC):
         """
         self.play(clip_name)
 
+    def wait_until_idle(self) -> None:
+        """Block until every clip currently playing has finished.
+
+        Used by the runtime to hold the inference loop off while the
+        bootup announcement is still audible — the system must not
+        emit a pulse before the operator has heard "starting up". The
+        default implementation is a no-op (in-memory fakes never have
+        anything to wait on); `FileSpeaker` overrides it to wait on
+        all live playback subprocesses.
+
+        Preconditions:
+            - `__init__` completed.
+            - Caller is on a thread allowed to block.
+
+        Postconditions:
+            - No tracked playback subprocess is still running.
+        """
+        return
+
     @abc.abstractmethod
     def close(self) -> None:
         """Release background resources and stop any ongoing playback.
@@ -331,6 +350,32 @@ class FileSpeaker(Speaker):
             proc.wait()
         except Exception:
             self._logger.exception("Speaker: wait failed for clip %s", clip_name)
+
+    def wait_until_idle(self) -> None:
+        """Wait for every currently-tracked playback subprocess to exit.
+
+        Used by the runtime to ensure bootup audio finishes before the
+        inference loop arms the gate. Snapshot-and-wait pattern: we
+        copy the live process list under the lock then wait on each
+        copy outside the lock so concurrent `play()` calls on other
+        threads aren't blocked by our wait.
+
+        Preconditions:
+            - `__init__` completed.
+            - Caller is on a non-loop thread.
+
+        Postconditions:
+            - All processes that were live when this method was
+              entered have exited (or their `wait()` raised, which is
+              suppressed).
+        """
+        with self._lock:
+            snapshot = list(self._procs)
+        for proc in snapshot:
+            try:
+                proc.wait()
+            except Exception:
+                self._logger.exception("Speaker: wait_until_idle failed for a clip")
 
     def _spawn(self, clip_name: str) -> subprocess.Popen[bytes] | None:
         """Resolve `clip_name` and spawn the playback subprocess.
