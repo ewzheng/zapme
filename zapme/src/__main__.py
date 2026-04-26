@@ -26,7 +26,14 @@ from zapme.src.model.classifier import SlouchClassifier
 from zapme.src.model.vision import PoseEstimator
 from zapme.src.runtime.feature_buffer import FeatureBuffer
 from zapme.src.runtime.gate import FakeGate, Gate, LgpioGate
-from zapme.src.runtime.loop import Debouncer, DebouncerConfig, Loop, open_camera
+from zapme.src.runtime.loop import (
+    Debouncer,
+    DebouncerConfig,
+    Loop,
+    Pulser,
+    PulserConfig,
+    open_camera,
+)
 from zapme.src.runtime.watchdog import Watchdog
 
 
@@ -82,6 +89,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--off-threshold", type=float, default=0.4)
     parser.add_argument("--debounce-window", type=int, default=20)
     parser.add_argument("--min-on-fraction", type=float, default=0.6)
+
+    parser.add_argument(
+        "--cooldown", type=float, default=15.0,
+        help="Seconds the gate is locked low after a pulse fires. "
+             "Each slouch detection produces a single one-frame pulse, "
+             "then the gate is forced low for this many seconds — gives "
+             "the user time to remove the EMS pad if anything malfunctions. "
+             "Set to 0 to disable (not recommended).",
+    )
 
     parser.add_argument(
         "--watchdog-timeout", type=float, default=1.0,
@@ -201,6 +217,12 @@ def main() -> int:
             min_on_fraction=args.min_on_fraction,
         )
     )
+    pulser = Pulser(config=PulserConfig(cooldown_s=args.cooldown))
+    if args.cooldown <= 0:
+        log.warning(
+            "Cooldown disabled — every rising-edge slouch will fire a pulse. "
+            "This is unsafe for body-worn EMS; reconsider before plugging in."
+        )
 
     gate = _build_gate(
         backend=backend,
@@ -238,6 +260,7 @@ def main() -> int:
         classifier=classifier,
         buffer=buffer,
         debouncer=debouncer,
+        pulser=pulser,
         gate=gate,
         watchdog=watchdog,
         log_interval_s=args.log_interval,

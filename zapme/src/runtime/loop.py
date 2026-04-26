@@ -22,6 +22,7 @@ meaningful in the context of the loop's `slouch_prob` stream.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -142,7 +143,8 @@ class Debouncer:
 
         if not self._active:
             high = sum(1 for p in self._window if p >= self._cfg.on_threshold)
-            if high / len(self._window) >= self._cfg.min_on_fraction:
+            required = math.ceil(self._cfg.window_size * self._cfg.min_on_fraction)
+            if high >= required:
                 self._active = True
         else:
             mean_prob = sum(self._window) / len(self._window)
@@ -179,6 +181,151 @@ class Debouncer:
         """
         self._window.clear()
         self._active = False
+
+
+@dataclass(frozen=True)
+class PulserConfig:
+    """Single-pulse + cooldown safety policy.
+
+    Attributes:
+        cooldown_s: After a pulse fires, the minimum elapsed time
+            before another pulse can fire. Defaults to 15 seconds —
+            conservative enough to give the user time to physically
+            remove the EMS pad if anything malfunctions, short enough
+            that a real demo still produces multiple pulses across a
+            longer session. Set to `0.0` to disable the cooldown
+            (every rising edge fires); not recommended for safety.
+    """
+
+    cooldown_s: float = 15.0
+
+
+class Pulser:
+    """Converts a sustained `should_be_active` stream into single-frame pulses with cooldown.
+
+    The debouncer produces a slow-moving "yes / no, currently slouching"
+    signal that can stay `True` for many seconds. Without a pulser the
+    gate would stay continuously asserted for that whole duration. The
+    pulser instead emits `True` for **one frame** on the rising edge
+    of the debouncer's output, then enforces a cooldown during which
+    the output is always `False` regardless of input.
+
+    Safety contract:
+
+    - At most one `True` output per cooldown window.
+    - Output drops to `False` automatically the frame *after* a pulse.
+    - After the cooldown expires, the next pulse requires a fresh
+      rising edge — i.e. the debouncer must go inactive and then
+      active again. A user who is *still* slouching when the cooldown
+      ends does not get re-zapped without first releasing.
+    """
+
+    def __init__(self, config: PulserConfig | None = None) -> None:
+        """Initialize a fresh pulser, ready to fire on the first rising edge.
+
+        Args:
+            config: Single-pulse + cooldown policy. Defaults to a
+                15-second cooldown.
+
+        Raises:
+            ValueError: If `cooldown_s < 0`.
+
+        Preconditions:
+            - None.
+
+        Postconditions:
+            - No pulse has been fired.
+            - `is_in_cooldown()` returns `False`.
+        """
+        cfg = config or PulserConfig()
+        if cfg.cooldown_s < 0:
+            raise ValueError(f"cooldown_s must be >= 0, got {cfg.cooldown_s}")
+        self._cfg = cfg
+        self._last_pulse_time: float | None = None
+        self._prev_active = False
+
+    def step(self, should_be_active: bool) -> bool:
+        """Decide whether to fire a pulse this frame.
+
+        Args:
+            should_be_active: Latest `Debouncer` output for this frame.
+
+        Returns:
+            `True` when the gate should be asserted *this frame only*.
+            The very next call to `step()` will return `False` unless
+            the debouncer has gone inactive and back to active *and*
+            the cooldown has elapsed.
+
+        Preconditions:
+            - `__init__` completed.
+
+        Postconditions:
+            - When this method returns `True`, `is_in_cooldown()`
+              returns `True` until `cooldown_s` has elapsed.
+            - Internal "previous active" state is updated to track the
+              rising edge for the next call.
+        """
+        now = time.perf_counter()
+        rising_edge = should_be_active and not self._prev_active
+        in_cooldown = (
+            self._last_pulse_time is not None
+            and (now - self._last_pulse_time) < self._cfg.cooldown_s
+        )
+        pulse = rising_edge and not in_cooldown
+        if pulse:
+            self._last_pulse_time = now
+        self._prev_active = should_be_active
+        return pulse
+
+    def is_in_cooldown(self) -> bool:
+        """Return whether a recent pulse is still locking out new ones.
+
+        Returns:
+            `True` if a pulse fired within the last `cooldown_s`.
+
+        Preconditions:
+            - `__init__` completed.
+
+        Postconditions:
+            - No state change.
+        """
+        if self._last_pulse_time is None:
+            return False
+        return (time.perf_counter() - self._last_pulse_time) < self._cfg.cooldown_s
+
+    def cooldown_remaining_s(self) -> float:
+        """Return seconds until the next pulse is allowed.
+
+        Returns:
+            `0.0` if no cooldown is active; otherwise a positive number
+            of seconds until the lockout expires.
+
+        Preconditions:
+            - `__init__` completed.
+
+        Postconditions:
+            - No state change.
+        """
+        if self._last_pulse_time is None:
+            return 0.0
+        elapsed = time.perf_counter() - self._last_pulse_time
+        return max(0.0, self._cfg.cooldown_s - elapsed)
+
+    def reset(self) -> None:
+        """Clear cooldown state and edge-tracking.
+
+        Useful when the loop restarts after a fault and prior
+        edge / cooldown bookkeeping is no longer meaningful.
+
+        Preconditions:
+            - `__init__` completed.
+
+        Postconditions:
+            - `is_in_cooldown()` returns `False`.
+            - The next `step(True)` call will fire a pulse.
+        """
+        self._last_pulse_time = None
+        self._prev_active = False
 
 
 def open_camera(index: int) -> cv2.VideoCapture:
@@ -233,6 +380,7 @@ class Loop:
         classifier: SlouchClassifier,
         buffer: FeatureBuffer,
         debouncer: Debouncer,
+        pulser: Pulser,
         gate: Gate,
         watchdog: Watchdog,
         log_interval_s: float = 1.0,
@@ -250,6 +398,9 @@ class Loop:
                 window. Reset on entry to `run()` so prior state does
                 not leak in.
             debouncer: Hysteresis debouncer over `slouch_prob`.
+            pulser: Single-frame-pulse + cooldown safety wrapper that
+                converts the debouncer's sustained signal into bounded
+                gate assertions.
             gate: Owned by `watchdog`; passed in here so that the loop
                 can also enforce gate-off in its `finally` block as a
                 belt-and-suspenders safety measure.
@@ -275,6 +426,7 @@ class Loop:
         self._classifier = classifier
         self._buffer = buffer
         self._debouncer = debouncer
+        self._pulser = pulser
         self._gate = gate
         self._watchdog = watchdog
         self._log_interval_s = log_interval_s
@@ -298,6 +450,7 @@ class Loop:
         """
         self._buffer.reset()
         self._debouncer.reset()
+        self._pulser.reset()
         last_log = 0.0
         try:
             self._watchdog.start()
@@ -312,17 +465,27 @@ class Loop:
                 self._buffer.push(features)
                 window = self._buffer.as_window()
                 prob = self._classifier.predict(window)
-                should_be_active = self._debouncer.update(prob)
-                self._watchdog.set_active(should_be_active)
+                debounce_active = self._debouncer.update(prob)
+                pulse = self._pulser.step(debounce_active)
+                if pulse:
+                    self._logger.warning(
+                        "Pulse fired (prob=%.2f); cooldown=%.1fs",
+                        prob,
+                        self._pulser.cooldown_remaining_s(),
+                    )
+                self._watchdog.set_active(pulse)
                 self._watchdog.heartbeat()
 
                 now = time.perf_counter()
                 if self._log_interval_s == 0 or now - last_log >= self._log_interval_s:
                     last_log = now
+                    cd = self._pulser.cooldown_remaining_s()
                     self._logger.info(
-                        "prob=%.2f gate=%s buffer_full=%s",
+                        "prob=%.2f debounce=%s pulse=%s cooldown=%.1fs buffer_full=%s",
                         prob,
-                        "ON" if should_be_active else "off",
+                        "on" if debounce_active else "off",
+                        "FIRE" if pulse else "-",
+                        cd,
                         self._buffer.is_full(),
                     )
         finally:
@@ -333,5 +496,6 @@ class Loop:
                 self._logger.exception("Gate.close raised in Loop.run finally")
             self._buffer.reset()
             self._debouncer.reset()
+            self._pulser.reset()
 
         return 1 if self._watchdog.is_tripped() else 0
