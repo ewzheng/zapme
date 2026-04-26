@@ -143,6 +143,41 @@ def test_reset_method_returns_to_idle() -> None:
     assert e.step(True) == EscalationAction.WARN_1
 
 
+def test_audio_busy_pauses_warn_to_warn_countdown() -> None:
+    """While audio_busy=True the warn-to-warn countdown freezes."""
+    e = _make(warn_to_warn=0.1, warn_to_fire=0.1)
+    assert e.step(True) == EscalationAction.WARN_1
+    # Sleep enough to normally trigger WARN_2…
+    time.sleep(0.15)
+    # …but report the speaker as busy. No advance, no emit.
+    for _ in range(5):
+        assert e.step(True, audio_busy=True) == EscalationAction.NONE
+    # Audio finishes; first non-busy step still inside warn_to_warn
+    # window (which restarted at the last busy call) so still NONE.
+    assert e.step(True, audio_busy=False) == EscalationAction.NONE
+    # After the full warn_to_warn elapses post-audio, WARN_2 fires.
+    time.sleep(0.15)
+    assert e.step(True, audio_busy=False) == EscalationAction.WARN_2
+
+
+def test_audio_busy_in_idle_does_not_emit_warn_1() -> None:
+    """A re-engagement during leftover audio does not blast WARN_1."""
+    e = _make()
+    # Audio still playing from a previous cycle, debounce just went on.
+    assert e.step(True, audio_busy=True) == EscalationAction.NONE
+    # Audio ends; the next step starts the ladder fresh.
+    assert e.step(True, audio_busy=False) == EscalationAction.WARN_1
+
+
+def test_audio_busy_does_not_block_release_reset() -> None:
+    """Releasing while audio_busy still resets the escalator to IDLE."""
+    e = _make(warn_to_warn=0.1)
+    assert e.step(True) == EscalationAction.WARN_1
+    e.step(False, audio_busy=True)  # release should still reset
+    # Next active step starts a new ladder from WARN_1.
+    assert e.step(True) == EscalationAction.WARN_1
+
+
 def test_negative_delay_rejected() -> None:
     """Non-positive delays reject construction (any of the three)."""
     with pytest.raises(ValueError, match="delays"):

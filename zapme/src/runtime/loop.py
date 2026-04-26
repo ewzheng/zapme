@@ -565,11 +565,22 @@ class WarningEscalator:
         self._state = self._State.IDLE
         self._state_entered_at = 0.0
 
-    def step(self, debounce_active: bool) -> EscalationAction:
+    def step(
+        self, debounce_active: bool, audio_busy: bool = False,
+    ) -> EscalationAction:
         """Advance the state machine by one frame.
 
         Args:
             debounce_active: Latest output of the upstream `Debouncer`.
+            audio_busy: Whether the speaker is still playing a clip
+                from a prior step. When `True`, the inter-step
+                countdown is **paused** (state's effective entry
+                time is bumped to "now") and no new action is
+                emitted. This prevents back-to-back warning audio
+                overlap: the next warning starts measuring its
+                `warn_to_warn_s` only after the previous clip ends.
+                Defaults to `False` for callers that don't track
+                audio (existing tests, hardware-less paths).
 
         Returns:
             The action the loop should take this frame:
@@ -585,6 +596,9 @@ class WarningEscalator:
 
         Postconditions:
             - On `debounce_active=False`, state collapses to IDLE.
+            - On `audio_busy=True` while in any non-IDLE state, the
+              state's `_state_entered_at` is set to `now` so the
+              countdown effectively pauses.
             - The state machine may transition through multiple
               states in one call (e.g. POST_FIRE → IDLE → WAIT_WARN_2)
               but emits at most one action per call.
@@ -593,6 +607,17 @@ class WarningEscalator:
         if not debounce_active:
             self._state = self._State.IDLE
             self._state_entered_at = now
+            return EscalationAction.NONE
+
+        if audio_busy:
+            # Hold the inter-step countdown at zero while a previous
+            # clip is still playing — otherwise short `warn_to_warn_s`
+            # values stack the next warning on top of the current
+            # clip and the user hears overlapping audio. From IDLE
+            # we also wait, so a re-engagement during a leftover
+            # zapscream doesn't immediately blast WARN_1.
+            if self._state != self._State.IDLE:
+                self._state_entered_at = now
             return EscalationAction.NONE
 
         # Process timed transitions in a loop so a single call can
@@ -705,6 +730,7 @@ class Loop:
         watchdog: Watchdog,
         log_interval_s: float = 1.0,
         missing_pose_reset_frames: int = 5,
+        pulse_duration_s: float = 0.3,
         logger: logging.Logger | None = None,
     ) -> None:
         """Wire all the runtime components together.
@@ -744,6 +770,17 @@ class Loop:
                 Smaller = snappier reset but more sensitive to YOLO
                 blinks. Default 5 ≈ 0.3-1s of absence depending on
                 FPS.
+            pulse_duration_s: Wall-clock seconds to keep the gate
+                asserted on a fire event. The pulser only emits
+                `True` for one inference frame (~50-200ms depending
+                on FPS), which is too short for many EMS units to
+                actually deliver a stim — the relay clicks but the
+                muscle contraction never lands. We stretch that
+                one-frame trigger into a continuous gate-high window
+                of this many seconds. Default 0.3s is a comfortable
+                EMS trigger length without being long enough to be
+                unsafe; bump via `--pulse-duration` if your unit
+                needs more.
             logger: Logger for runtime events. Defaults to a
                 module-scoped logger.
 
@@ -769,11 +806,21 @@ class Loop:
         self._log_interval_s = log_interval_s
         self._missing_pose_reset_frames = missing_pose_reset_frames
         self._missing_pose_count = 0
+        if pulse_duration_s <= 0:
+            raise ValueError(
+                f"pulse_duration_s must be positive, got {pulse_duration_s}"
+            )
+        self._pulse_duration_s = pulse_duration_s
         # Deferred-pulse signal: set by the zap-sequence worker after
         # `zapwarn` finishes, consumed by the next loop iteration so
         # the gate fires only after the spoken warning has played.
         self._zap_lock = threading.Lock()
         self._zap_pending = False
+        # Wall-clock deadline until which the gate must stay asserted
+        # (set when the pulser fires; cleared once `time.perf_counter()`
+        # passes it). This stretches the one-frame pulse into a
+        # configurable window so the EMS unit actually triggers.
+        self._pulse_active_until: float | None = None
         self._logger = logger or logging.getLogger(__name__)
 
     def run(self) -> int:
@@ -797,6 +844,7 @@ class Loop:
         self._escalator.reset()
         self._pulser.reset()
         self._missing_pose_count = 0
+        self._pulse_active_until = None
         with self._zap_lock:
             self._zap_pending = False
         self._warmup()
@@ -842,7 +890,14 @@ class Loop:
                     # Skip the classifier; don't feed garbage forward.
                     prob = 0.0
                 debounce_active = self._debouncer.update(prob)
-                action = self._escalator.step(debounce_active)
+                # Pause the escalator's countdown while a previous
+                # warning clip is still playing — otherwise short
+                # warn-to-warn intervals stack overlapping audio and
+                # the user hears warnings one on top of another.
+                audio_busy = self._speaker.is_busy()
+                action = self._escalator.step(
+                    debounce_active, audio_busy=audio_busy
+                )
                 if action == EscalationAction.WARN_1:
                     self._logger.warning("Escalator: warning 1 (prob=%.2f)", prob)
                     self._speaker.play("firstwarn")
@@ -860,14 +915,32 @@ class Loop:
                 # never on the escalator's FIRE frame directly. This
                 # is what gives the audio a chance to play before the
                 # gate goes hot.
-                pulse = self._pulser.step(self._consume_zap_pending())
-                if pulse:
+                pulse_now = self._pulser.step(self._consume_zap_pending())
+                tick_start = time.perf_counter()
+                if pulse_now:
+                    self._pulse_active_until = tick_start + self._pulse_duration_s
                     self._logger.warning(
-                        "Pulse fired (prob=%.2f); cooldown=%.1fs",
+                        "Pulse armed for %.2fs (prob=%.2f); pulser cooldown=%.1fs",
+                        self._pulse_duration_s,
                         prob,
                         self._pulser.cooldown_remaining_s(),
                     )
-                self._watchdog.set_active(pulse)
+                # Hold the gate asserted for the full configured pulse
+                # duration. The pulser's one-frame True triggers it,
+                # but a single inference frame (~50-200ms) is too
+                # short for many EMS units to actually deliver a
+                # stim — the relay clicks but the muscle never
+                # contracts. We stretch via a wall-clock deadline.
+                gate_active = (
+                    self._pulse_active_until is not None
+                    and tick_start < self._pulse_active_until
+                )
+                if (
+                    not gate_active
+                    and self._pulse_active_until is not None
+                ):
+                    self._pulse_active_until = None
+                self._watchdog.set_active(gate_active)
                 self._watchdog.heartbeat()
 
                 now = time.perf_counter()
@@ -875,12 +948,13 @@ class Loop:
                     last_log = now
                     cd = self._pulser.cooldown_remaining_s()
                     self._logger.info(
-                        "prob=%.2f person=%s debounce=%s action=%s pulse=%s cooldown=%.1fs buffer_full=%s",
+                        "prob=%.2f person=%s audio=%s debounce=%s action=%s gate=%s cooldown=%.1fs buffer_full=%s",
                         prob,
                         "yes" if person_present else "no",
+                        "busy" if audio_busy else "idle",
                         "on" if debounce_active else "off",
                         action.name,
-                        "FIRE" if pulse else "-",
+                        "HIGH" if gate_active else "low",
                         cd,
                         self._buffer.is_full(),
                     )

@@ -110,10 +110,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cooldown", type=float, default=15.0,
         help="Seconds the gate is locked low after a pulse fires. "
-             "Each slouch detection produces a single one-frame pulse, "
-             "then the gate is forced low for this many seconds — gives "
+             "Each slouch detection produces a single pulse, then "
+             "the gate is forced low for this many seconds — gives "
              "the user time to remove the EMS pad if anything malfunctions. "
              "Set to 0 to disable (not recommended).",
+    )
+    parser.add_argument(
+        "--pulse-duration", type=float, default=0.3,
+        help="Wall-clock seconds to keep the gate asserted on each "
+             "fire. Default 0.3s. The pulser only emits True for one "
+             "inference frame (~50-200ms depending on FPS), which is "
+             "too short for many EMS units to actually trigger — the "
+             "relay clicks but no stim is delivered. Bump this to "
+             "0.5-1.0s if your unit needs longer trigger pulses. "
+             "Capped by --cooldown for safety.",
     )
 
     parser.add_argument(
@@ -322,6 +332,13 @@ def main() -> int:
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _signal_handler)
 
+    if args.pulse_duration > args.cooldown and args.cooldown > 0:
+        log.warning(
+            "--pulse-duration (%.2fs) exceeds --cooldown (%.2fs); clamping pulse to cooldown.",
+            args.pulse_duration, args.cooldown,
+        )
+        args.pulse_duration = args.cooldown
+
     loop = Loop(
         camera=camera,
         estimator=estimator,
@@ -334,6 +351,7 @@ def main() -> int:
         gate=gate,
         watchdog=watchdog,
         log_interval_s=args.log_interval,
+        pulse_duration_s=args.pulse_duration,
         logger=log.getChild("loop"),
     )
 

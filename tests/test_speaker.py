@@ -82,6 +82,16 @@ def test_fake_speaker_play_sequence_after_play() -> None:
     assert s.played == ["firstwarn", "zapwarn", "zapscream"]
 
 
+def test_fake_speaker_is_busy_always_false() -> None:
+    """In-memory fake never has playback in flight."""
+    s = FakeSpeaker()
+    assert s.is_busy() is False
+    s.play("firstwarn")
+    assert s.is_busy() is False
+    s.play_sequence(["zapwarn", "zapscream"])
+    assert s.is_busy() is False
+
+
 def test_implements_speaker_interface() -> None:
     """Both implementations are substitutable as `Speaker`."""
     assert isinstance(FakeSpeaker(), Speaker)

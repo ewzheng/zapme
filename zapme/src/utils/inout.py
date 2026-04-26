@@ -136,6 +136,28 @@ class Speaker(abc.ABC):
         """
         return
 
+    def is_busy(self) -> bool:
+        """Return whether any playback is currently in flight.
+
+        Used by the inference loop to pause the warning escalator
+        while a previous warning clip is still playing — otherwise
+        a short `warn_to_warn_s` setting causes the next warning to
+        start before the previous clip has finished, and the user
+        hears overlapping audio that sounds like rapid-fire alerts.
+
+        Returns:
+            `True` if at least one tracked playback subprocess is
+            still running. Default implementation always returns
+            `False` (in-memory fakes are instantaneous).
+
+        Preconditions:
+            - `__init__` completed.
+
+        Postconditions:
+            - No state change.
+        """
+        return False
+
     @abc.abstractmethod
     def close(self) -> None:
         """Release background resources and stop any ongoing playback.
@@ -376,6 +398,28 @@ class FileSpeaker(Speaker):
                 proc.wait()
             except Exception:
                 self._logger.exception("Speaker: wait_until_idle failed for a clip")
+
+    def is_busy(self) -> bool:
+        """Return True if any tracked playback subprocess is still alive.
+
+        Polls (via `Popen.poll()`) every tracked process and returns
+        as soon as one is found still running. Cheap enough to call
+        every loop iteration. The runtime uses it to pause the
+        warning escalator while a clip is in flight, so subsequent
+        warnings don't overlap.
+
+        Returns:
+            `True` if at least one playback subprocess is alive.
+
+        Preconditions:
+            - `__init__` completed.
+
+        Postconditions:
+            - No state change. Finished processes remain in `_procs`
+              until the next `play()` prunes them; that's harmless.
+        """
+        with self._lock:
+            return any(p.poll() is None for p in self._procs)
 
     def _spawn(self, clip_name: str) -> subprocess.Popen[bytes] | None:
         """Resolve `clip_name` and spawn the playback subprocess.
