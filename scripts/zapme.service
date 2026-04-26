@@ -1,0 +1,66 @@
+# Systemd unit for zapme — vision-driven posture corrector.
+#
+# Boots the runtime loop automatically on Pi power-on. Combined with a
+# physical power switch on the box, this gives the operator a single
+# physical gesture to start / stop the whole system: flip the switch
+# on, the Pi boots and zapme starts; flip it off, everything dies.
+#
+# Install:
+#
+#   sudo cp scripts/zapme.service /etc/systemd/system/zapme.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable zapme.service       # start on every boot
+#   sudo systemctl start  zapme.service       # start now
+#   sudo systemctl status zapme.service       # check
+#   journalctl -u zapme.service -f            # live logs
+#
+# Edit before installing if your username, repo path, GPIO pin,
+# camera index, etc. differ from the defaults below.
+
+[Unit]
+Description=Zapme posture corrector
+# Wait for udev so /dev/video* and /dev/gpiochip* are populated
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=pi
+Group=gpio
+WorkingDirectory=/home/pi/zapme
+
+# Force unbuffered stdout/stderr so journalctl shows logs in real time
+Environment=PYTHONUNBUFFERED=1
+
+# Use the venv's Python so the service does not depend on system Python
+# being correctly configured.
+ExecStart=/home/pi/zapme/.venv/bin/python -m zapme.src \
+    --backend lgpio \
+    --weights /home/pi/zapme/models/slouch_cnn.onnx \
+    --camera 0 \
+    --gate-pin 17 \
+    --cooldown 15 \
+    --on-threshold 0.8 \
+    --off-threshold 0.4
+
+# Restart only on non-zero exit (watchdog trip → exit 1). Don't restart
+# on clean exit (operator pressed Ctrl-C, exit 0).
+Restart=on-failure
+RestartSec=3
+
+# Cap restart attempts so a stuck failure mode doesn't hammer the gate
+# every few seconds. Five failures within a minute → stop trying.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Send SIGTERM on stop so the Python signal handler runs (closes the
+# camera, stops the watchdog, drives the gate low). Wait up to 5s for
+# clean shutdown before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
