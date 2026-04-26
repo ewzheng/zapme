@@ -51,6 +51,7 @@ MLP_FEATURES: tuple[str, ...] = (
     "eye_pitch_norm",
     "arm_above_shoulder",
     "arm_visibility",
+    "head_to_neck_angle_deg",
 )
 NUM_FEATURES: int = len(MLP_FEATURES)
 EAR_DROP_INDEX: int = MLP_FEATURES.index("ear_drop")
@@ -137,6 +138,16 @@ class SlouchFeatures:
             Always defined. Higher when arms are detected (e.g. behind
             the head or stretched out) than when they are tucked below
             the desk and out of frame.
+        head_to_neck_angle_deg: Signed angle, in degrees, between the
+            `shoulder_mid → ear` vector (the neck axis) and the
+            `shoulder_mid → nose` vector (the body-to-nose vector). `0°`
+            when the nose is aligned with the neck axis (head sitting
+            naturally on top of the neck); positive when the head juts
+            *forward* of the neck axis (chin-out / forward-lean
+            slouching). The angle scales with the **fraction** of neck
+            length the head deviates by, not raw pixels — so it stays
+            comparable across long-necked and short-necked subjects in
+            a way that `forward_lean_deg` and `head_pitch` do not.
     """
 
     shoulder_width_px: float
@@ -155,6 +166,7 @@ class SlouchFeatures:
     eye_pitch_norm: float | None
     arm_above_shoulder: float
     arm_visibility: float
+    head_to_neck_angle_deg: float | None
 
     def as_vector(self) -> np.ndarray:
         """Return the classifier-input vector as a 1D `float32` array.
@@ -346,6 +358,20 @@ def compute_slouch_features(pose: Pose) -> SlouchFeatures | None:
     else:
         arm_above_shoulder = 0.0
 
+    if ear_x is not None and nose_c >= KEYPOINT_CONF_MIN:
+        neck_dx = ear_x - sho_mid_x
+        neck_dy = ear_y - sho_mid_y
+        head_dx = nose_x_full - sho_mid_x
+        head_dy = nose_y - sho_mid_y
+        dot = neck_dx * head_dx + neck_dy * head_dy
+        cross = neck_dx * head_dy - neck_dy * head_dx
+        if neck_dx == 0.0 and neck_dy == 0.0:
+            head_to_neck_angle_deg: float | None = None
+        else:
+            head_to_neck_angle_deg = float(math.degrees(math.atan2(cross, dot)))
+    else:
+        head_to_neck_angle_deg = None
+
     return SlouchFeatures(
         shoulder_width_px=shoulder_width,
         ear_drop=ear_drop,
@@ -363,4 +389,5 @@ def compute_slouch_features(pose: Pose) -> SlouchFeatures | None:
         eye_pitch_norm=eye_pitch_norm,
         arm_above_shoulder=arm_above_shoulder,
         arm_visibility=arm_visibility,
+        head_to_neck_angle_deg=head_to_neck_angle_deg,
     )
