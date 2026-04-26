@@ -39,6 +39,14 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from pathlib import Path
+
+# Self-bootstrap so the script works regardless of whether
+# `pip install -e .` succeeded. Adds the repo root (parent of
+# `scripts/`) to sys.path so `from zapme...` resolves.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from zapme.src.__main__ import main
 from zapme.src.utils.tens_control import DEFAULT_TENS_PIN, TensController
