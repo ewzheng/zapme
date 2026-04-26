@@ -496,9 +496,9 @@ class EscalationConfig:
             a release at any point still resets immediately.
     """
 
-    warn_to_warn_s: float = 5.0
-    warn_to_fire_s: float = 5.0
-    fire_to_warn_s: float = 5.0
+    warn_to_warn_s: float = 10.0
+    warn_to_fire_s: float = 10.0
+    fire_to_warn_s: float = 10.0
 
 
 class EscalationAction(enum.IntEnum):
@@ -538,9 +538,9 @@ class WarningEscalator:
         """Initialize a fresh escalator in the idle state.
 
         Args:
-            config: Time-delay configuration. Defaults to 5s between
-                warning 1 and warning 2, 5s between warning 2 and the
-                fire, and 5s of post-fire silence before the warning
+            config: Time-delay configuration. Defaults to 10s between
+                warning 1 and warning 2, 10s between warning 2 and the
+                fire, and 10s of post-fire silence before the warning
                 cycle restarts.
 
         Raises:
@@ -704,6 +704,7 @@ class Loop:
         gate: Gate,
         watchdog: Watchdog,
         log_interval_s: float = 1.0,
+        missing_pose_reset_frames: int = 5,
         logger: logging.Logger | None = None,
     ) -> None:
         """Wire all the runtime components together.
@@ -735,6 +736,14 @@ class Loop:
                 in the `finally`.
             log_interval_s: Minimum seconds between per-frame stdout
                 log lines. Set to `0` to log every frame.
+            missing_pose_reset_frames: Consecutive frames with no
+                detected person before the buffer / debouncer /
+                escalator are wiped. A returning user then starts
+                fresh instead of being scored against a stale
+                NaN-heavy window (which the classifier maps to ~1.0).
+                Smaller = snappier reset but more sensitive to YOLO
+                blinks. Default 5 ≈ 0.3-1s of absence depending on
+                FPS.
             logger: Logger for runtime events. Defaults to a
                 module-scoped logger.
 
@@ -758,6 +767,8 @@ class Loop:
         self._gate = gate
         self._watchdog = watchdog
         self._log_interval_s = log_interval_s
+        self._missing_pose_reset_frames = missing_pose_reset_frames
+        self._missing_pose_count = 0
         self._logger = logger or logging.getLogger(__name__)
 
     def run(self) -> int:
@@ -780,6 +791,7 @@ class Loop:
         self._debouncer.reset()
         self._escalator.reset()
         self._pulser.reset()
+        self._missing_pose_count = 0
         self._warmup()
         last_log = 0.0
         try:
@@ -797,10 +809,24 @@ class Loop:
                     break
 
                 pose = self._estimator.infer(frame)
-                features = compute_slouch_features(pose) if pose is not None else None
-                self._buffer.push(features)
-                window = self._buffer.as_window()
-                prob = self._classifier.predict(window)
+                person_present = pose is not None
+                if person_present:
+                    self._missing_pose_count = 0
+                    features = compute_slouch_features(pose)
+                    self._buffer.push(features)
+                    window = self._buffer.as_window()
+                    prob = self._classifier.predict(window)
+                else:
+                    self._missing_pose_count += 1
+                    if self._missing_pose_count == self._missing_pose_reset_frames:
+                        # Sustained absence — wipe state so a returning
+                        # user isn't scored against a NaN-heavy window
+                        # (which the classifier maps to ~1.0).
+                        self._buffer.reset()
+                        self._debouncer.reset()
+                        self._escalator.reset()
+                    # Skip the classifier; don't feed garbage forward.
+                    prob = 0.0
                 debounce_active = self._debouncer.update(prob)
                 action = self._escalator.step(debounce_active)
                 if action == EscalationAction.WARN_1:
@@ -825,8 +851,9 @@ class Loop:
                     last_log = now
                     cd = self._pulser.cooldown_remaining_s()
                     self._logger.info(
-                        "prob=%.2f debounce=%s action=%s pulse=%s cooldown=%.1fs buffer_full=%s",
+                        "prob=%.2f person=%s debounce=%s action=%s pulse=%s cooldown=%.1fs buffer_full=%s",
                         prob,
+                        "yes" if person_present else "no",
                         "on" if debounce_active else "off",
                         action.name,
                         "FIRE" if pulse else "-",

@@ -113,15 +113,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--warn-to-warn", type=float, default=5.0,
+        "--warn-to-warn", type=float, default=10.0,
         help="Seconds of sustained slouch between warning 1 and warning 2.",
     )
     parser.add_argument(
-        "--warn-to-fire", type=float, default=5.0,
+        "--warn-to-fire", type=float, default=10.0,
         help="Seconds of sustained slouch between warning 2 and the EMS pulse.",
     )
     parser.add_argument(
-        "--fire-to-warn", type=float, default=5.0,
+        "--fire-to-warn", type=float, default=10.0,
         help="Seconds of silence after a FIRE before the warning cycle "
              "restarts. Warnings cycle (unlike the zap, which is "
              "one-shot-per-slouch) so an uncorrected user keeps getting "
