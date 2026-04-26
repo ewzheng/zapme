@@ -92,6 +92,7 @@ class TrainConfig:
     dropout: float = 0.5
     label_smoothing: float = 0.1
     feature_noise_std: float = 0.05
+    mixup_alpha: float = 0.2
 
 
 def load_combined(data_glob: str) -> pd.DataFrame:
@@ -436,6 +437,47 @@ class SlouchCNN(nn.Module):
         return self.body(self.normalizer(x))
 
 
+def _mixup_batch(
+    X: torch.Tensor,
+    y: torch.Tensor,
+    alpha: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Apply mixup to a batch: convex-combine pairs of windows + labels.
+
+    Pairs are formed by random permutation within the batch. The mix
+    coefficient `lambda` is drawn from `Beta(alpha, alpha)` once per
+    batch (not per sample). At alpha=0.2 the distribution concentrates
+    near 0 and 1, so most mixed samples stay close to one of the two
+    originals; at alpha=1.0 it becomes uniform on `[0, 1]`.
+
+    Args:
+        X: Feature tensor `(B, C, T)` on any device.
+        y: Integer label tensor `(B,)` on the same device.
+        alpha: Beta distribution parameter. `0` disables mixup (the
+            caller should branch on `alpha > 0` before calling).
+
+    Returns:
+        Tuple `(X_mixed, y_a, y_b, lam)`:
+        - `X_mixed`: `lam * X + (1-lam) * X[perm]`.
+        - `y_a`: original labels (use with weight `lam` in the loss).
+        - `y_b`: permuted labels (use with weight `1-lam`).
+        - `lam`: the sampled mix coefficient.
+
+    Preconditions:
+        - `alpha > 0`.
+        - `X` and `y` share the same batch dimension.
+
+    Postconditions:
+        - Returned tensors live on the same device as the inputs.
+        - The caller computes `lam * loss(logits, y_a) +
+          (1 - lam) * loss(logits, y_b)` to use the mix.
+    """
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(X.size(0), device=X.device)
+    X_mixed = lam * X + (1.0 - lam) * X[perm]
+    return X_mixed, y, y[perm], lam
+
+
 class SlouchONNXWrapper(nn.Module):
     """Inference-time wrapper that emits a single slouch probability.
 
@@ -594,12 +636,24 @@ def train_one_split(
             if noise_scale is not None:
                 X_batch = X_batch + torch.randn_like(X_batch) * noise_scale * cfg.feature_noise_std
             optim.zero_grad()
-            logits = model(X_batch)
-            loss = F.cross_entropy(logits, y_batch, label_smoothing=cfg.label_smoothing)
+            if cfg.mixup_alpha > 0:
+                X_mixed, y_a, y_b, lam = _mixup_batch(X_batch, y_batch, cfg.mixup_alpha)
+                logits = model(X_mixed)
+                loss = (
+                    lam * F.cross_entropy(logits, y_a, label_smoothing=cfg.label_smoothing)
+                    + (1.0 - lam) * F.cross_entropy(logits, y_b, label_smoothing=cfg.label_smoothing)
+                )
+                preds = logits.argmax(dim=-1)
+                train_correct += int(
+                    (lam * (preds == y_a).float() + (1 - lam) * (preds == y_b).float()).sum().item()
+                )
+            else:
+                logits = model(X_batch)
+                loss = F.cross_entropy(logits, y_batch, label_smoothing=cfg.label_smoothing)
+                train_correct += int((logits.argmax(dim=-1) == y_batch).sum().item())
             loss.backward()
             optim.step()
             train_loss_sum += float(loss.item()) * X_batch.size(0)
-            train_correct += int((logits.argmax(dim=-1) == y_batch).sum().item())
             train_n += X_batch.size(0)
 
         val_acc, val_per_class, val_confusion = evaluate(
@@ -692,12 +746,24 @@ def train_on_all(
             if noise_scale is not None:
                 X_batch = X_batch + torch.randn_like(X_batch) * noise_scale * cfg.feature_noise_std
             optim.zero_grad()
-            logits = model(X_batch)
-            loss = F.cross_entropy(logits, y_batch, label_smoothing=cfg.label_smoothing)
+            if cfg.mixup_alpha > 0:
+                X_mixed, y_a, y_b, lam = _mixup_batch(X_batch, y_batch, cfg.mixup_alpha)
+                logits = model(X_mixed)
+                loss = (
+                    lam * F.cross_entropy(logits, y_a, label_smoothing=cfg.label_smoothing)
+                    + (1.0 - lam) * F.cross_entropy(logits, y_b, label_smoothing=cfg.label_smoothing)
+                )
+                preds = logits.argmax(dim=-1)
+                train_correct += int(
+                    (lam * (preds == y_a).float() + (1 - lam) * (preds == y_b).float()).sum().item()
+                )
+            else:
+                logits = model(X_batch)
+                loss = F.cross_entropy(logits, y_batch, label_smoothing=cfg.label_smoothing)
+                train_correct += int((logits.argmax(dim=-1) == y_batch).sum().item())
             loss.backward()
             optim.step()
             train_loss_sum += float(loss.item()) * X_batch.size(0)
-            train_correct += int((logits.argmax(dim=-1) == y_batch).sum().item())
             train_n += X_batch.size(0)
         train_loss = train_loss_sum / max(train_n, 1)
         train_acc = train_correct / max(train_n, 1)
@@ -953,6 +1019,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--mixup-alpha", type=float, default=0.2,
+        help=(
+            "Mixup interpolation strength. `lambda ~ Beta(alpha, alpha)` "
+            "is sampled per batch and used to convex-combine pairs of "
+            "(window, label) samples. 0 disables mixup; 0.2 is "
+            "conservative; 0.4-1.0 is aggressive. Helps the model "
+            "interpolate smoothly between training examples and reduces "
+            "overconfidence — particularly useful here because CV folds "
+            "show train acc plateauing at 95%%+ while val degrades."
+        ),
+    )
+    parser.add_argument(
         "--multiclass", action="store_true",
         help=(
             "Train on the full upright/slouch/shrimp 3-class label space. "
@@ -1017,6 +1095,7 @@ def main() -> int:
         dropout=args.dropout,
         label_smoothing=args.label_smoothing,
         feature_noise_std=args.feature_noise_std,
+        mixup_alpha=args.mixup_alpha,
     )
 
     device = torch.device(

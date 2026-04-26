@@ -26,6 +26,11 @@ LEFT_EAR = 3
 RIGHT_EAR = 4
 LEFT_SHOULDER = 5
 RIGHT_SHOULDER = 6
+LEFT_ELBOW = 7
+RIGHT_ELBOW = 8
+LEFT_WRIST = 9
+RIGHT_WRIST = 10
+ARM_KEYPOINTS = (LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST, RIGHT_WRIST)
 
 KEYPOINT_CONF_MIN = 0.3
 SHOULDER_WIDTH_MIN_PX = 20.0
@@ -44,6 +49,8 @@ MLP_FEATURES: tuple[str, ...] = (
     "shoulder_height_asymmetry",
     "head_yaw",
     "eye_pitch_norm",
+    "arm_above_shoulder",
+    "arm_visibility",
 )
 NUM_FEATURES: int = len(MLP_FEATURES)
 EAR_DROP_INDEX: int = MLP_FEATURES.index("ear_drop")
@@ -117,6 +124,19 @@ class SlouchFeatures:
             than ears do, so this becomes more positive. Uses eyes
             instead of nose so it stays informative when the nose
             keypoint is occluded or low-confidence.
+        arm_above_shoulder: `max(0, shoulder_mid_y -
+            min(visible arm keypoint y)) / shoulder_width`. `0` when no
+            arm keypoint (elbow / wrist) is visible above the shoulder
+            line; positive and growing as wrists / elbows rise. Lets
+            the classifier disambiguate "head dropped toward shoulders"
+            (slouch) from "shoulders raised toward head" (arms engaged):
+            both shift `ear_drop` the same way, but only the latter
+            shifts this feature.
+        arm_visibility: Mean confidence across the four arm keypoints
+            (`left_elbow`, `right_elbow`, `left_wrist`, `right_wrist`).
+            Always defined. Higher when arms are detected (e.g. behind
+            the head or stretched out) than when they are tucked below
+            the desk and out of frame.
     """
 
     shoulder_width_px: float
@@ -133,6 +153,8 @@ class SlouchFeatures:
     shoulder_height_asymmetry: float
     head_yaw: float | None
     eye_pitch_norm: float | None
+    arm_above_shoulder: float
+    arm_visibility: float
 
     def as_vector(self) -> np.ndarray:
         """Return the classifier-input vector as a 1D `float32` array.
@@ -308,6 +330,22 @@ def compute_slouch_features(pose: Pose) -> SlouchFeatures | None:
     else:
         eye_pitch_norm = None
 
+    arm_y_values: list[float] = []
+    arm_confs: list[float] = []
+    for kp_idx in ARM_KEYPOINTS:
+        _, arm_y, arm_c = kp[kp_idx]
+        arm_confs.append(float(arm_c))
+        if arm_c >= KEYPOINT_CONF_MIN:
+            arm_y_values.append(float(arm_y))
+    arm_visibility = float(sum(arm_confs) / len(arm_confs))
+    if arm_y_values:
+        highest_arm_y = min(arm_y_values)
+        arm_above_shoulder = float(
+            max(0.0, (sho_mid_y - highest_arm_y) / shoulder_width)
+        )
+    else:
+        arm_above_shoulder = 0.0
+
     return SlouchFeatures(
         shoulder_width_px=shoulder_width,
         ear_drop=ear_drop,
@@ -323,4 +361,6 @@ def compute_slouch_features(pose: Pose) -> SlouchFeatures | None:
         shoulder_height_asymmetry=shoulder_height_asymmetry,
         head_yaw=head_yaw,
         eye_pitch_norm=eye_pitch_norm,
+        arm_above_shoulder=arm_above_shoulder,
+        arm_visibility=arm_visibility,
     )
