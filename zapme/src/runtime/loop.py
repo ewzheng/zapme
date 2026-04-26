@@ -451,6 +451,7 @@ class Loop:
         self._buffer.reset()
         self._debouncer.reset()
         self._pulser.reset()
+        self._warmup()
         last_log = 0.0
         try:
             self._watchdog.start()
@@ -499,3 +500,45 @@ class Loop:
             self._pulser.reset()
 
         return 1 if self._watchdog.is_tripped() else 0
+
+    def _warmup(self) -> None:
+        """Run one dummy inference to amortize first-frame JIT / allocator costs.
+
+        YOLO's first `predict()` call on a freshly-loaded model takes
+        seconds (JIT compile, weight upload to the inference engine,
+        first-allocation overhead) — much longer than the watchdog's
+        per-iteration timeout. Doing the warmup *before* the watchdog
+        starts keeps the cold-start cost out of the heartbeat budget,
+        so the first real frame in `run()` is already at steady-state
+        speed.
+
+        Failures during warmup are logged but not raised — the real
+        loop will hit the same problem and produce a more useful
+        error in context.
+
+        Preconditions:
+            - All injected components are constructed.
+
+        Postconditions:
+            - The pose estimator and classifier have been called once
+              with a dummy black frame.
+            - `_buffer` and `_debouncer` and `_pulser` are reset (the
+              warmup may have pushed one feature vector through).
+        """
+        try:
+            self._logger.info("Warming up model (first inference is slow)...")
+            dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+            pose = self._estimator.infer(dummy)
+            features = (
+                compute_slouch_features(pose) if pose is not None else None
+            )
+            self._buffer.push(features)
+            window = self._buffer.as_window()
+            self._classifier.predict(window)
+            self._logger.info("Warmup complete.")
+        except Exception:
+            self._logger.exception("Warmup failed; continuing into the loop anyway")
+        finally:
+            self._buffer.reset()
+            self._debouncer.reset()
+            self._pulser.reset()
