@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import math
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -351,23 +352,134 @@ def _pick_capture_backend() -> int:
     return cv2.CAP_ANY
 
 
-def open_camera(index: int) -> cv2.VideoCapture:
-    """Open a webcam by OpenCV index, with low-latency settings applied.
+class LatestFrameCamera:
+    """Background-thread wrapper around `cv2.VideoCapture` that always serves the freshest frame.
 
-    Forces `CAP_PROP_BUFFERSIZE = 1` so `cap.read()` always returns the
-    most recent frame — without this, the driver queues frames and a
-    slow consumer ends up reading frames that are seconds out of date.
-    Also pins the platform-native capture backend (DirectShow on
-    Windows, V4L2 on Linux) which avoids the OpenCV default-backend
-    fallback dance.
+    `cv2.VideoCapture.read()` returns the *oldest* queued frame from
+    the driver's buffer, not the latest. When the consumer (the loop)
+    runs slower than the camera's native FPS, the queue grows and
+    every `read()` returns a frame that's tens or hundreds of
+    milliseconds old. `CAP_PROP_BUFFERSIZE = 1` helps but doesn't
+    eliminate the problem — many drivers ignore the hint, and the
+    camera firmware itself can buffer.
+
+    This class fixes it the brute-force way: a daemon thread
+    continuously calls `cap.read()` in a tight loop and overwrites a
+    single shared "latest frame" slot. The runtime's `read()` returns
+    whatever's currently in that slot — instantly, with no waiting on
+    the camera. Old frames are never returned because new ones
+    overwrite them as soon as they're decoded.
+
+    Quacks like a `cv2.VideoCapture` for the methods the loop actually
+    uses (`read()` / `release()`), so it's a drop-in replacement.
+    """
+
+    def __init__(self, cap: cv2.VideoCapture) -> None:
+        """Wrap an already-opened `cv2.VideoCapture` and start the reader thread.
+
+        Args:
+            cap: An opened `cv2.VideoCapture`. This wrapper takes
+                ownership and will `release()` it on its own
+                `release()`.
+
+        Preconditions:
+            - `cap.isOpened()` is true.
+
+        Postconditions:
+            - The reader thread is running.
+            - The first frame has been primed synchronously, so the
+              first `read()` call has data to return.
+        """
+        self._cap = cap
+        self._latest: np.ndarray | None = None
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        ok, frame = self._cap.read()
+        if ok:
+            self._latest = frame
+        self._thread = threading.Thread(
+            target=self._reader, daemon=True, name="zapme-camera-reader"
+        )
+        self._thread.start()
+
+    def _reader(self) -> None:
+        """Continuously read frames in a tight loop, overwriting `_latest`.
+
+        Runs until `_stop_event` is set. Failed reads (camera blip,
+        end-of-stream) are silently ignored — the previous good frame
+        stays in the slot until a new good one arrives.
+
+        Preconditions:
+            - Called only as the target of the daemon thread.
+
+        Postconditions:
+            - Exits when `_stop_event` is set.
+        """
+        while not self._stop_event.is_set():
+            ok, frame = self._cap.read()
+            if ok:
+                with self._lock:
+                    self._latest = frame
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        """Return the most recently grabbed frame, without blocking on the camera.
+
+        Returns:
+            `(True, frame)` if at least one frame has ever been
+            captured; `(False, None)` only if the camera has not yet
+            produced any frame at all (typical only on the very first
+            call after a slow startup).
+
+        Preconditions:
+            - `__init__` completed.
+            - `release()` has not been called.
+
+        Postconditions:
+            - No I/O is performed on the camera in the calling thread.
+            - The returned frame is the live shared buffer; the next
+              reader-thread iteration may overwrite it. Copy it if
+              the caller plans to mutate.
+        """
+        with self._lock:
+            latest = self._latest
+        if latest is None:
+            return False, None
+        return True, latest
+
+    def release(self) -> None:
+        """Stop the reader thread and release the underlying camera.
+
+        Idempotent. Best-effort: if the reader thread doesn't exit
+        within 2 seconds it's left to die with the process (it's a
+        daemon).
+
+        Preconditions:
+            - `__init__` completed.
+
+        Postconditions:
+            - The reader thread has exited (or 2 seconds have elapsed).
+            - The underlying `cv2.VideoCapture` has been released.
+        """
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._cap.release()
+
+
+def open_camera(index: int) -> LatestFrameCamera:
+    """Open a webcam by OpenCV index, with always-fresh-frame semantics.
+
+    Pins the platform-native capture backend (DirectShow on Windows,
+    V4L2 on Linux), sets `CAP_PROP_BUFFERSIZE = 1`, and wraps the
+    capture in a `LatestFrameCamera` so the runtime always reads the
+    freshest frame regardless of how slow its iteration loop is.
 
     Args:
         index: OpenCV camera index. `0` is the first camera the
             platform reports (usually the built-in laptop webcam).
 
     Returns:
-        An opened `cv2.VideoCapture` with low-latency settings. The
-        caller owns it and must `.release()` when done.
+        A `LatestFrameCamera` ready for `read()` / `release()`.
 
     Raises:
         RuntimeError: If the camera cannot be opened.
@@ -376,16 +488,14 @@ def open_camera(index: int) -> cv2.VideoCapture:
         - A webcam exists at `index`.
 
     Postconditions:
-        - The returned capture has `isOpened()` true.
-        - `CAP_PROP_BUFFERSIZE = 1` has been requested (drivers may
-          ignore the hint, but on common Pi / Windows webcams it
-          takes effect).
+        - The returned camera's reader thread is running.
+        - The first frame has been primed.
     """
     cap = cv2.VideoCapture(index, _pick_capture_backend())
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open camera index {index}")
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return cap
+    return LatestFrameCamera(cap)
 
 
 class Loop:
@@ -409,7 +519,7 @@ class Loop:
 
     def __init__(
         self,
-        camera: cv2.VideoCapture,
+        camera: LatestFrameCamera,
         estimator: PoseEstimator,
         classifier: SlouchClassifier,
         buffer: FeatureBuffer,
@@ -423,8 +533,9 @@ class Loop:
         """Wire all the runtime components together.
 
         Args:
-            camera: Opened `cv2.VideoCapture`. The loop does not open
-                or release it — caller owns the lifecycle.
+            camera: Opened `LatestFrameCamera` (or anything that
+                duck-types `read()` / `release()`). The loop does not
+                open or release it — caller owns the lifecycle.
             estimator: Pose estimator (e.g. `PoseEstimator(...)`).
             classifier: Slouch classifier; can be the placeholder rule
                 or a trained ONNX-backed instance.
