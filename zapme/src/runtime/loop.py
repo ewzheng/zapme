@@ -21,6 +21,7 @@ meaningful in the context of the loop's `slouch_prob` stream.
 
 from __future__ import annotations
 
+import enum
 import logging
 import math
 import sys
@@ -38,6 +39,7 @@ from zapme.src.model.vision import PoseEstimator
 from zapme.src.runtime.feature_buffer import FeatureBuffer
 from zapme.src.runtime.gate import Gate
 from zapme.src.runtime.watchdog import Watchdog
+from zapme.src.utils.inout import Speaker
 
 
 @dataclass(frozen=True)
@@ -466,6 +468,178 @@ class LatestFrameCamera:
         self._cap.release()
 
 
+@dataclass(frozen=True)
+class EscalationConfig:
+    """Time-based ladder from a sustained slouch to an EMS pulse.
+
+    The runtime issues *two warnings* before any pulse fires; this
+    config controls the gaps between each step. Any drop to inactive
+    (user releases the slouch) resets the ladder.
+
+    Unlike the zap (which is sticky-once-per-slouch via the pulser),
+    the **warnings cycle**: after the FIRE action is emitted, the
+    escalator goes through a brief silent post-fire window and then
+    starts the warning ladder over from warning 1. So a user who
+    refuses to correct gets warn → warn → zap → (silence) → warn →
+    warn → (zap blocked by pulser cooldown) → warn → warn → zap …
+
+    Attributes:
+        warn_to_warn_s: After warning 1 fires, the debouncer must
+            stay continuously active for at least this many seconds
+            before warning 2 fires.
+        warn_to_fire_s: After warning 2 fires, the debouncer must
+            stay continuously active for at least this many seconds
+            before the pulse is allowed.
+        fire_to_warn_s: After a FIRE is emitted, the escalator stays
+            silent for this many seconds before the warning ladder
+            restarts. Only used when the debouncer remains active —
+            a release at any point still resets immediately.
+    """
+
+    warn_to_warn_s: float = 5.0
+    warn_to_fire_s: float = 5.0
+    fire_to_warn_s: float = 5.0
+
+
+class EscalationAction(enum.IntEnum):
+    """One-frame decision emitted by `WarningEscalator.step()`."""
+
+    NONE = 0
+    WARN_1 = 1
+    WARN_2 = 2
+    FIRE = 3
+
+
+class WarningEscalator:
+    """State machine: idle → warn_1 → warn_2 → fire → (silence) → idle (cycle).
+
+    Sits between the debouncer (which produces a sustained "slouching
+    now" boolean) and the pulser/gate (which would otherwise zap on
+    the first detection). Each escalation step requires the debouncer
+    to remain active for the configured delay; a single drop to
+    inactive resets back to idle.
+
+    Unlike the pulser (one-shot per slouch event), the warnings
+    **cycle** if the user keeps slouching: after `FIRE`, the
+    escalator enters a silent `POST_FIRE` window, then loops back to
+    issuing warnings. This way an uncorrected slouch keeps getting
+    nagged. The pulser still gates actual EMS pulses with its own
+    cooldown, so the audio cycle and the physical zap rate are
+    decoupled.
+    """
+
+    class _State(enum.IntEnum):
+        IDLE = 0
+        WAIT_WARN_2 = 1
+        WAIT_FIRE = 2
+        POST_FIRE = 3
+
+    def __init__(self, config: EscalationConfig | None = None) -> None:
+        """Initialize a fresh escalator in the idle state.
+
+        Args:
+            config: Time-delay configuration. Defaults to 5s between
+                warning 1 and warning 2, 5s between warning 2 and the
+                fire, and 5s of post-fire silence before the warning
+                cycle restarts.
+
+        Raises:
+            ValueError: If any delay is non-positive.
+
+        Preconditions:
+            - None.
+
+        Postconditions:
+            - `step(False)` returns `NONE`.
+            - The next `step(True)` returns `WARN_1`.
+        """
+        cfg = config or EscalationConfig()
+        if cfg.warn_to_warn_s <= 0 or cfg.warn_to_fire_s <= 0 or cfg.fire_to_warn_s <= 0:
+            raise ValueError(
+                f"escalation delays must be positive, got "
+                f"warn_to_warn={cfg.warn_to_warn_s}s, "
+                f"warn_to_fire={cfg.warn_to_fire_s}s, "
+                f"fire_to_warn={cfg.fire_to_warn_s}s"
+            )
+        self._cfg = cfg
+        self._state = self._State.IDLE
+        self._state_entered_at = 0.0
+
+    def step(self, debounce_active: bool) -> EscalationAction:
+        """Advance the state machine by one frame.
+
+        Args:
+            debounce_active: Latest output of the upstream `Debouncer`.
+
+        Returns:
+            The action the loop should take this frame:
+
+            - `NONE`: nothing — keep classifying.
+            - `WARN_1`: play warning 1 audio (do not pulse).
+            - `WARN_2`: play warning 2 audio (do not pulse).
+            - `FIRE`: pulse may fire this frame (subject to pulser
+              cooldown); play any optional fire-cue audio.
+
+        Preconditions:
+            - `__init__` completed.
+
+        Postconditions:
+            - On `debounce_active=False`, state collapses to IDLE.
+            - The state machine may transition through multiple
+              states in one call (e.g. POST_FIRE → IDLE → WAIT_WARN_2)
+              but emits at most one action per call.
+        """
+        now = time.perf_counter()
+        if not debounce_active:
+            self._state = self._State.IDLE
+            self._state_entered_at = now
+            return EscalationAction.NONE
+
+        # Process timed transitions in a loop so a single call can
+        # walk POST_FIRE → IDLE and immediately re-enter the warn
+        # ladder when the post-fire silence has fully elapsed.
+        while True:
+            if self._state == self._State.IDLE:
+                self._state = self._State.WAIT_WARN_2
+                self._state_entered_at = now
+                return EscalationAction.WARN_1
+
+            if self._state == self._State.WAIT_WARN_2:
+                if now - self._state_entered_at >= self._cfg.warn_to_warn_s:
+                    self._state = self._State.WAIT_FIRE
+                    self._state_entered_at = now
+                    return EscalationAction.WARN_2
+                return EscalationAction.NONE
+
+            if self._state == self._State.WAIT_FIRE:
+                if now - self._state_entered_at >= self._cfg.warn_to_fire_s:
+                    self._state = self._State.POST_FIRE
+                    self._state_entered_at = now
+                    return EscalationAction.FIRE
+                return EscalationAction.NONE
+
+            if self._state == self._State.POST_FIRE:
+                if now - self._state_entered_at >= self._cfg.fire_to_warn_s:
+                    self._state = self._State.IDLE
+                    self._state_entered_at = now
+                    continue
+                return EscalationAction.NONE
+
+            return EscalationAction.NONE
+
+    def reset(self) -> None:
+        """Force the state machine back to idle.
+
+        Preconditions:
+            - `__init__` completed.
+
+        Postconditions:
+            - The next `step(True)` returns `WARN_1`.
+        """
+        self._state = self._State.IDLE
+        self._state_entered_at = 0.0
+
+
 def open_camera(index: int) -> LatestFrameCamera:
     """Open a webcam by OpenCV index, with always-fresh-frame semantics.
 
@@ -524,6 +698,8 @@ class Loop:
         classifier: SlouchClassifier,
         buffer: FeatureBuffer,
         debouncer: Debouncer,
+        escalator: WarningEscalator,
+        speaker: Speaker,
         pulser: Pulser,
         gate: Gate,
         watchdog: Watchdog,
@@ -543,8 +719,13 @@ class Loop:
                 window. Reset on entry to `run()` so prior state does
                 not leak in.
             debouncer: Hysteresis debouncer over `slouch_prob`.
+            escalator: Two-warnings-before-zap state machine. Issues
+                spoken warnings via `speaker` before allowing the
+                pulser to fire.
+            speaker: Audio output for spoken warnings + the optional
+                fire cue. Use `FakeSpeaker` for silent dry-runs.
             pulser: Single-frame-pulse + cooldown safety wrapper that
-                converts the debouncer's sustained signal into bounded
+                converts the escalator's `FIRE` action into bounded
                 gate assertions.
             gate: Owned by `watchdog`; passed in here so that the loop
                 can also enforce gate-off in its `finally` block as a
@@ -571,6 +752,8 @@ class Loop:
         self._classifier = classifier
         self._buffer = buffer
         self._debouncer = debouncer
+        self._escalator = escalator
+        self._speaker = speaker
         self._pulser = pulser
         self._gate = gate
         self._watchdog = watchdog
@@ -595,6 +778,7 @@ class Loop:
         """
         self._buffer.reset()
         self._debouncer.reset()
+        self._escalator.reset()
         self._pulser.reset()
         self._warmup()
         last_log = 0.0
@@ -618,13 +802,21 @@ class Loop:
                 window = self._buffer.as_window()
                 prob = self._classifier.predict(window)
                 debounce_active = self._debouncer.update(prob)
-                pulse = self._pulser.step(debounce_active)
+                action = self._escalator.step(debounce_active)
+                if action == EscalationAction.WARN_1:
+                    self._logger.warning("Escalator: warning 1 (prob=%.2f)", prob)
+                    self._speaker.play("warning_1")
+                elif action == EscalationAction.WARN_2:
+                    self._logger.warning("Escalator: warning 2 (prob=%.2f)", prob)
+                    self._speaker.play("warning_2")
+                pulse = self._pulser.step(action == EscalationAction.FIRE)
                 if pulse:
                     self._logger.warning(
                         "Pulse fired (prob=%.2f); cooldown=%.1fs",
                         prob,
                         self._pulser.cooldown_remaining_s(),
                     )
+                    self._speaker.play("zap")
                 self._watchdog.set_active(pulse)
                 self._watchdog.heartbeat()
 
@@ -633,9 +825,10 @@ class Loop:
                     last_log = now
                     cd = self._pulser.cooldown_remaining_s()
                     self._logger.info(
-                        "prob=%.2f debounce=%s pulse=%s cooldown=%.1fs buffer_full=%s",
+                        "prob=%.2f debounce=%s action=%s pulse=%s cooldown=%.1fs buffer_full=%s",
                         prob,
                         "on" if debounce_active else "off",
+                        action.name,
                         "FIRE" if pulse else "-",
                         cd,
                         self._buffer.is_full(),
@@ -646,8 +839,13 @@ class Loop:
                 self._gate.close()
             except Exception:
                 self._logger.exception("Gate.close raised in Loop.run finally")
+            try:
+                self._speaker.close()
+            except Exception:
+                self._logger.exception("Speaker.close raised in Loop.run finally")
             self._buffer.reset()
             self._debouncer.reset()
+            self._escalator.reset()
             self._pulser.reset()
 
         return 1 if self._watchdog.is_tripped() else 0

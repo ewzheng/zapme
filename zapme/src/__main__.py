@@ -29,12 +29,18 @@ from zapme.src.runtime.gate import FakeGate, Gate, LgpioGate
 from zapme.src.runtime.loop import (
     Debouncer,
     DebouncerConfig,
+    EscalationConfig,
     Loop,
     Pulser,
     PulserConfig,
+    WarningEscalator,
     open_camera,
 )
 from zapme.src.runtime.watchdog import Watchdog
+from zapme.src.utils.inout import FakeSpeaker, FileSpeaker, Speaker
+
+DEFAULT_ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets"
+DEFAULT_CLIPS = ("warning_1", "warning_2", "zap")
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,6 +110,33 @@ def parse_args() -> argparse.Namespace:
              "then the gate is forced low for this many seconds — gives "
              "the user time to remove the EMS pad if anything malfunctions. "
              "Set to 0 to disable (not recommended).",
+    )
+
+    parser.add_argument(
+        "--warn-to-warn", type=float, default=5.0,
+        help="Seconds of sustained slouch between warning 1 and warning 2.",
+    )
+    parser.add_argument(
+        "--warn-to-fire", type=float, default=5.0,
+        help="Seconds of sustained slouch between warning 2 and the EMS pulse.",
+    )
+    parser.add_argument(
+        "--fire-to-warn", type=float, default=5.0,
+        help="Seconds of silence after a FIRE before the warning cycle "
+             "restarts. Warnings cycle (unlike the zap, which is "
+             "one-shot-per-slouch) so an uncorrected user keeps getting "
+             "nagged. The pulser cooldown still gates the physical zap.",
+    )
+    parser.add_argument(
+        "--no-audio", action="store_true",
+        help="Disable spoken warnings — uses an in-memory FakeSpeaker so the "
+             "loop still runs the warning state machine but no sound plays. "
+             "Useful for benchtop testing.",
+    )
+    parser.add_argument(
+        "--assets-dir", type=Path, default=DEFAULT_ASSETS_DIR,
+        help="Directory containing voice clip WAV files. The runtime "
+             "looks for warning_1.wav / warning_2.wav / zap.wav in here.",
     )
 
     parser.add_argument(
@@ -228,12 +261,28 @@ def main() -> int:
             min_on_fraction=args.min_on_fraction,
         )
     )
+    escalator = WarningEscalator(
+        config=EscalationConfig(
+            warn_to_warn_s=args.warn_to_warn,
+            warn_to_fire_s=args.warn_to_fire,
+            fire_to_warn_s=args.fire_to_warn,
+        )
+    )
     pulser = Pulser(config=PulserConfig(cooldown_s=args.cooldown))
     if args.cooldown <= 0:
         log.warning(
             "Cooldown disabled — every rising-edge slouch will fire a pulse. "
             "This is unsafe for body-worn EMS; reconsider before plugging in."
         )
+
+    speaker: Speaker
+    if args.no_audio:
+        speaker = FakeSpeaker()
+        log.info("Audio disabled (--no-audio); warnings will not play out loud.")
+    else:
+        clip_map = {name: args.assets_dir / f"{name}.wav" for name in DEFAULT_CLIPS}
+        speaker = FileSpeaker(clips=clip_map, logger=log.getChild("speaker"))
+        log.info("Audio assets dir: %s", args.assets_dir)
 
     gate = _build_gate(
         backend=backend,
@@ -271,6 +320,8 @@ def main() -> int:
         classifier=classifier,
         buffer=buffer,
         debouncer=debouncer,
+        escalator=escalator,
+        speaker=speaker,
         pulser=pulser,
         gate=gate,
         watchdog=watchdog,
