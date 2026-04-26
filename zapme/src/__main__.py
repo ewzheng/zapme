@@ -66,6 +66,13 @@ def parse_args() -> argparse.Namespace:
         help="YOLO detection confidence threshold.",
     )
     parser.add_argument(
+        "--imgsz", type=int, default=320,
+        help="YOLO input image size (square). Lower = faster inference. "
+             "Default 320 is ~4x the FPS of YOLO's standard 640. Bump "
+             "to 640 if you need more keypoint precision and your "
+             "hardware can keep up.",
+    )
+    parser.add_argument(
         "--weights", type=Path, default=Path("models/slouch_cnn.onnx"),
         help="Trained slouch classifier ONNX path. If absent, the "
              "placeholder rule is used so the loop still runs.",
@@ -201,6 +208,7 @@ def main() -> int:
         repo_id=args.repo,
         filename=args.filename,
         confidence_threshold=args.conf,
+        imgsz=args.imgsz,
     )
 
     weights_path = args.weights if args.weights.exists() else None

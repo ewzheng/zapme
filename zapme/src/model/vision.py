@@ -18,6 +18,7 @@ from zapme.src.model._common import load_yolo_from_hf
 
 DEFAULT_REPO_ID = "Ultralytics/YOLO11"
 DEFAULT_FILENAME = "yolo11n-pose.pt"
+DEFAULT_IMGSZ = 320
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,7 @@ class PoseEstimator:
         filename: str = DEFAULT_FILENAME,
         revision: str | None = None,
         confidence_threshold: float = 0.25,
+        imgsz: int = DEFAULT_IMGSZ,
     ) -> None:
         """Load and prepare the pose model.
 
@@ -64,12 +66,20 @@ class PoseEstimator:
             revision: Optional git revision pin for reproducibility.
             confidence_threshold: Minimum bounding-box confidence below which
                 detections are dropped.
+            imgsz: Square input edge length (pixels) the model resizes
+                each frame to before inference. Lower = much faster but
+                less precise on small details. `320` is roughly 4× the
+                FPS of YOLO's default `640` at a small accuracy cost,
+                which is the right tradeoff on a Pi 4 CPU where the
+                15-frame temporal buffer means single-frame precision
+                matters less than overall throughput.
 
         Preconditions:
             - The HF repo + filename combination resolves to a YOLO-format
               pose checkpoint compatible with the installed `ultralytics`
               version.
             - `confidence_threshold` lies in `[0, 1]`.
+            - `imgsz` is a positive multiple of 32 (YOLO requirement).
 
         Postconditions:
             - Model weights are downloaded to the HF cache (if not already
@@ -80,6 +90,7 @@ class PoseEstimator:
             repo_id=repo_id, filename=filename, revision=revision
         )
         self._conf = confidence_threshold
+        self._imgsz = imgsz
 
     def infer(self, frame: np.ndarray) -> Pose | None:
         """Run pose inference on a single frame.
@@ -101,7 +112,7 @@ class PoseEstimator:
             - Returned arrays are owned by the caller (safe to mutate).
         """
         results = self._model.predict(
-            source=frame, conf=self._conf, verbose=False
+            source=frame, conf=self._conf, imgsz=self._imgsz, verbose=False
         )
         if not results:
             return None
