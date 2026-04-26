@@ -11,9 +11,9 @@ independently does the EMS gating off-screen. Cameras pointed
 roughly the same way will produce roughly the same skeleton.
 
 Run:
-    python scripts/yolo_view.py
+    python scripts/yolo_view.py                # fullscreen by default
     python scripts/yolo_view.py --camera 1
-    python scripts/yolo_view.py --fullscreen
+    python scripts/yolo_view.py --windowed     # opt out of fullscreen
 
 Press `q` (with the window focused) to quit.
 """
@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
 
     Postconditions:
         - Returned namespace exposes `camera`, `repo`, `filename`,
-          `conf`, `fullscreen`.
+          `conf`, `windowed`.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -107,8 +107,10 @@ def parse_args() -> argparse.Namespace:
         help="YOLO detection confidence threshold.",
     )
     parser.add_argument(
-        "--fullscreen", action="store_true",
-        help="Open the window fullscreen — useful when projecting on a TV.",
+        "--windowed", action="store_true",
+        help="Open in a normal window instead of fullscreen. The "
+             "default is fullscreen since this script is intended "
+             "for the demo TV next to the Pi.",
     )
     return parser.parse_args()
 
@@ -140,7 +142,7 @@ def main() -> int:
         return 1
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    if args.fullscreen:
+    if not args.windowed:
         cv2.setWindowProperty(
             WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
         )
