@@ -49,6 +49,15 @@ WorkingDirectory=/opt/zapme
 # Force unbuffered stdout/stderr so journalctl shows logs in real time
 Environment=PYTHONUNBUFFERED=1
 
+# Audio routing for the system-level service. Pi OS Bookworm uses
+# PipeWire / PulseAudio, which lives in the user's runtime directory
+# at /run/user/<UID>. %U expands to the User=__USER__'s UID.
+# REQUIRES `sudo loginctl enable-linger __USER__` to be run once so
+# the user session (and therefore /run/user/%U) exists at boot before
+# anyone logs in.
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=PULSE_RUNTIME_PATH=/run/user/%U/pulse
+
 # Use the venv's Python so the service does not depend on system Python
 # being correctly configured. The venv must be created with
 # `--system-site-packages` so it can see the apt-installed lgpio.

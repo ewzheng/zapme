@@ -53,6 +53,13 @@ echo "Installing ${SERVICE_NAME} for User=${TARGET_USER} -> ${TARGET_FILE}"
 sed "s|__USER__|${TARGET_USER}|g" "${SOURCE_FILE}" > "${TARGET_FILE}"
 chmod 644 "${TARGET_FILE}"
 
+# Enable user lingering so /run/user/<UID> (the PulseAudio/PipeWire
+# socket dir) exists at boot before anyone logs in. Without this,
+# audio playback under the system service silently no-ops at boot
+# even though the rest of the runtime works.
+echo "Enabling user lingering for ${TARGET_USER} (so audio works at boot)..."
+loginctl enable-linger "${TARGET_USER}"
+
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}"
 
