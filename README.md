@@ -120,6 +120,8 @@ python scripts/live_test.py \
 
 The plain entry point (no banner, no self-test) is `python -m zapme.src` — use it under systemd / a shell wrapper for unattended runs. `Ctrl-C` always drops the line and exits cleanly.
 
+It is IMPERATIVE that you start with the TENS unit __**OFF**__ or else you will be shocked immediately. 
+
 ### Useful flags
 
 | Flag | Meaning |
