@@ -5,17 +5,34 @@
 # physical gesture to start / stop the whole system: flip the switch
 # on, the Pi boots and zapme starts; flip it off, everything dies.
 #
-# Install:
+# Repo install location: /opt/zapme (fixed). Only `User=` is per-machine
+# and gets substituted at install time. See `scripts/install_systemd.sh`
+# for the full one-shot install, or run the steps manually:
 #
-#   sudo cp scripts/zapme.service /etc/systemd/system/zapme.service
+#   sudo mkdir -p /opt/zapme && sudo chown -R $USER:$USER /opt/zapme
+#   git clone <repo-url> /opt/zapme       # or `mv ~/zapme /opt/zapme`
+#   cd /opt/zapme
+#   sudo apt install -y mpg123 python3-lgpio
+#   python3 -m venv .venv --system-site-packages
+#   .venv/bin/pip install -e .[pi]
+#
+#   sed "s|__USER__|$USER|g" scripts/zapme.service \
+#     | sudo tee /etc/systemd/system/zapme.service > /dev/null
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable zapme.service       # start on every boot
-#   sudo systemctl start  zapme.service       # start now
-#   sudo systemctl status zapme.service       # check
+#   sudo systemctl enable  zapme.service      # auto-start on boot
+#   sudo systemctl start   zapme.service      # start now
+#   sudo systemctl status  zapme.service      # check
 #   journalctl -u zapme.service -f            # live logs
 #
-# Edit before installing if your username, repo path, GPIO pin,
-# camera index, etc. differ from the defaults below.
+# Stop / disable / uninstall:
+#
+#   sudo systemctl stop    zapme.service
+#   sudo systemctl disable zapme.service
+#   sudo rm /etc/systemd/system/zapme.service
+#   sudo systemctl daemon-reload
+#
+# Edit GPIO pin, camera index, thresholds etc. directly in the
+# ExecStart= block below if they differ from the defaults.
 
 [Unit]
 Description=Zapme posture corrector
@@ -25,27 +42,29 @@ Wants=systemd-udev-settle.service
 
 [Service]
 Type=simple
-User=pi
+User=__USER__
 Group=gpio
-WorkingDirectory=/home/pi/zapme
+WorkingDirectory=/opt/zapme
 
 # Force unbuffered stdout/stderr so journalctl shows logs in real time
 Environment=PYTHONUNBUFFERED=1
 
 # Use the venv's Python so the service does not depend on system Python
-# being correctly configured.
-ExecStart=/home/pi/zapme/.venv/bin/python -m zapme.src \
+# being correctly configured. The venv must be created with
+# `--system-site-packages` so it can see the apt-installed lgpio.
+ExecStart=/opt/zapme/.venv/bin/python -m zapme.src \
     --backend lgpio \
-    --weights /home/pi/zapme/models/slouch_cnn.onnx \
+    --weights /opt/zapme/models/slouch_cnn.onnx \
     --camera 0 \
     --gate-pin 17 \
     --cooldown 15 \
+    --pulse-duration 0.3 \
     --on-threshold 0.8 \
     --off-threshold 0.4
 # Polarity defaults to active-LOW (line LOW = relay ON, HIGH at boot
 # = de-energized). If you ever swap to a relay that's wired the other
 # way (active-HIGH), append `--gate-active-high`. Verify with:
-#   .venv/bin/python -m zapme.src.utils.tens_control --pulse 0.5
+#   /opt/zapme/.venv/bin/python -m zapme.src.utils.tens_control --pulse 0.5
 # A clean silent→click→silent (with EMS pads unplugged) confirms the
 # default is correct.
 
