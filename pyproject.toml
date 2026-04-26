@@ -10,33 +10,39 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 
+# Pi-runtime dependencies only. Anything used solely for training the
+# slouch classifier or for developer tooling lives in `optional-dependencies`
+# below so the Pi install (`pip install -e .[pi]`) stays lean.
 dependencies = [
-  "huggingface_hub[cli]",
-  "transformers",
-  "datasets",
-  "bitsandbytes",
-  "torch",
-  "torchvision",
-  "pillow",
+  "huggingface_hub",  # downloads the YOLO pose checkpoint on first run
   "numpy",
-  "onnx",
-  "onnxruntime",
-  "opencv-python",
-  "ultralytics",
-  "pyarrow",
-  "pandas",
-  "pytest",
+  "onnxruntime",      # slouch-classifier inference
+  "opencv-python",    # camera capture
+  "ultralytics",      # YOLO pose (transitively pulls torch, pillow, etc.)
+  "pandas",           # ffill/bfill in clean_feature_window
 ]
 
 [project.optional-dependencies]
-# Install with: pip install -e .[pi]
+# Install on the Pi: pip install -e .[pi]
 # Only resolves on Linux aarch64 (Raspberry Pi OS 64-bit).
 pi = [
   "lgpio;     sys_platform == 'linux' and platform_machine == 'aarch64'",
   "gpiozero;  sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 
-# Install with: pip install -e .[dev]
+# Install on a desktop / HPC for training: pip install -e .[train]
+# Adds the model-training and ONNX-export stack on top of the runtime deps.
+train = [
+  "torch",
+  "torchvision",
+  "transformers",
+  "datasets",
+  "bitsandbytes",
+  "onnx",
+  "pyarrow",
+]
+
+# Install for development: pip install -e .[dev]
 dev = [
   "pytest",
   "ruff",

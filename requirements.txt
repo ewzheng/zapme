@@ -1,29 +1,34 @@
-# Top-level dependencies for zapme.
-# Source of truth lives in pyproject.toml; this file mirrors it for
-# convenience (`pip install -r requirements.txt`).
+# Full developer environment for zapme.
 #
-# Pi-only deps use environment markers, so this file installs cleanly
-# on both Windows (skips Pi deps) and the Pi (installs everything).
+# Includes everything: Pi-runtime deps + training stack + dev tools.
+# The source of truth for the *runtime* subset is pyproject.toml's
+# `[project.dependencies]`; this file mirrors it plus the `train` and
+# `dev` extras for one-shot `pip install -r requirements.txt`.
+#
+# Pi deployment should NOT use this file — use `pip install -e .[pi]`
+# instead, which skips the training/dev stack entirely.
 
-# Core ML / HF stack
-huggingface_hub[cli]
-transformers
-datasets
-bitsandbytes
-torch
-torchvision
-pillow
+# --- Pi-runtime core (mirrors pyproject [project.dependencies]) ---
+huggingface_hub
 numpy
-onnx
 onnxruntime
 opencv-python
 ultralytics
-pyarrow
 pandas
 
-# Utils
-pytest
+# --- Training stack (mirrors pyproject [train] extra) ---
+torch
+torchvision
+transformers
+datasets
+bitsandbytes
+onnx
+pyarrow
 
-# Pi-only hardware I/O. Resolves only on Linux aarch64 (Pi OS 64-bit).
+# --- Dev tools (mirrors pyproject [dev] extra) ---
+pytest
+ruff
+
+# --- Pi-only hardware I/O. Resolves only on Linux aarch64. ---
 lgpio;     sys_platform == "linux" and platform_machine == "aarch64"
 gpiozero;  sys_platform == "linux" and platform_machine == "aarch64"
