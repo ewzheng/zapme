@@ -1,0 +1,935 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js Audio-Reactive Humanlike Stickmen v4.11</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0d0f14;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: white;
+    }
+    #ui-container {
+      position: absolute;
+      top: 18px;
+      left: 18px;
+      z-index: 10;
+      width: min(350px, calc(100vw - 36px));
+      background: rgba(5, 7, 12, 0.72);
+      padding: 16px;
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.12);
+      box-shadow: 0 16px 45px rgba(0,0,0,0.35);
+      backdrop-filter: blur(10px);
+    }
+    h2 { margin: 0 0 6px 0; font-size: 1.1rem; }
+    p { margin: 0 0 12px 0; color: #c8d0dc; line-height: 1.35; font-size: 0.92rem; }
+    input[type="file"] { width: 100%; margin-top: 4px; }
+    audio { display: none; margin-top: 12px; width: 100%; }
+    canvas { display: block; }
+    #hint { margin-top: 10px; font-size: 0.8rem; color: #8fa0b7; }
+  </style>
+</head>
+<body>
+  <div id="ui-container">
+    <h2>🕺 Stickmen Dance Battle v4.11</h2>
+    <p>Realtime beat-tracking with continuous bass-driven gating — dancers genuinely chill out in quiet sections and explode at the drop. 144 move combinations.</p>
+    <input type="file" id="audio-upload" accept="audio/*" />
+    <audio id="audio-element" controls></audio>
+    <div id="hint">Tip: Wait for the bass to drop!</div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script>
+    'use strict';
+
+    // ---------- Small math helpers ----------
+    const TAU = Math.PI * 2;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const lerp = (a, b, t) => a + (b - a) * t;
+    const smoothstep = (edge0, edge1, x) => {
+      const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
+      return t * t * (3 - 2 * t);
+    };
+
+    // ---------- Three.js setup ----------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0d0f14);
+    scene.fog = new THREE.FogExp2(0x0d0f14, 0.014);
+
+    const camera = new THREE.PerspectiveCamera(56, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 7.8, 32);
+    camera.lookAt(0, 2.1, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    document.body.appendChild(renderer.domElement);
+
+    const hemi = new THREE.HemisphereLight(0xbfdcff, 0x110820, 0.65);
+    scene.add(hemi);
+
+    const keyLight = new THREE.DirectionalLight(0xffffff, 0.95);
+    keyLight.position.set(0, 14, 16);
+    scene.add(keyLight);
+
+    const rimLight = new THREE.DirectionalLight(0x67fff0, 0.45);
+    rimLight.position.set(-14, 7, -8);
+    scene.add(rimLight);
+
+    const grid = new THREE.GridHelper(150, 150, 0x00ffe1, 0x242936);
+    grid.position.y = -0.02;
+    scene.add(grid);
+
+    const stage = new THREE.Mesh(
+      new THREE.PlaneGeometry(62, 18),
+      new THREE.MeshBasicMaterial({ color: 0x101722, transparent: true, opacity: 0.38, side: THREE.DoubleSide })
+    );
+    stage.rotation.x = -Math.PI / 2;
+    stage.position.y = -0.03;
+    scene.add(stage);
+
+    // ---------- Stick figure factory ----------
+    const figures = [];
+    const numFigures = 11;
+    const spacing = 4.45;
+    const lineWidth = (numFigures - 1) * spacing;
+    const colors = [0xff2f6d, 0x00ffcc, 0xffd34d, 0xa56cff, 0x6cff79, 0xff70d9, 0x4dbdff];
+
+    function createBone(radius, length, material) {
+      const pivot = new THREE.Group();
+      const geometry = new THREE.CylinderGeometry(radius, radius, length, 10);
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.y = -length / 2;
+      pivot.add(mesh);
+      return pivot;
+    }
+
+    function addJoint(radius, material) {
+      return new THREE.Mesh(new THREE.SphereGeometry(radius, 12, 12), material);
+    }
+
+    function buildStickFigure(index, baseX, colorHex) {
+      const material = new THREE.MeshPhongMaterial({ color: colorHex, shininess: 95, specular: 0x222222 });
+      const root = new THREE.Group();
+      root.position.set(baseX, 0, 0);
+
+      const pelvis = new THREE.Group();
+      pelvis.position.y = 2.25;
+      root.add(pelvis);
+
+      const spine = createBone(0.16, 1.25, material);
+      spine.rotation.z = Math.PI; 
+      pelvis.add(spine);
+
+      const chest = new THREE.Group();
+      chest.position.y = 1.25;
+      pelvis.add(chest);
+
+      const chestBar = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 1.25, 10), material);
+      chestBar.rotation.z = Math.PI / 2;
+      chestBar.position.y = 0.15;
+      chest.add(chestBar);
+
+      const neck = createBone(0.10, 0.35, material);
+      neck.rotation.z = Math.PI;
+      neck.position.y = 0.27;
+      chest.add(neck);
+
+      const head = new THREE.Mesh(new THREE.SphereGeometry(0.48, 18, 18), material);
+      head.position.y = 0.86;
+      chest.add(head);
+
+      function makeArm(side) {
+        const shoulder = new THREE.Group();
+        shoulder.position.set(side * 0.72, 0.12, 0);
+        chest.add(shoulder);
+        shoulder.add(addJoint(0.18, material));
+
+        const upper = createBone(0.105, 1.05, material);
+        shoulder.add(upper);
+
+        const elbow = new THREE.Group();
+        elbow.position.y = -1.05;
+        shoulder.add(elbow);
+        elbow.add(addJoint(0.15, material));
+
+        const fore = createBone(0.09, 0.95, material);
+        elbow.add(fore);
+
+        const hand = addJoint(0.16, material);
+        hand.position.y = -0.95;
+        elbow.add(hand);
+        return { shoulder, elbow, upper, fore, hand };
+      }
+
+      function makeLeg(side) {
+        const hip = new THREE.Group();
+        hip.position.set(side * 0.34, 0, 0);
+        pelvis.add(hip);
+        hip.add(addJoint(0.18, material));
+
+        const thigh = createBone(0.13, 1.18, material);
+        hip.add(thigh);
+
+        const knee = new THREE.Group();
+        knee.position.y = -1.18;
+        hip.add(knee);
+        knee.add(addJoint(0.16, material));
+
+        const shin = createBone(0.115, 1.16, material);
+        knee.add(shin);
+
+        const foot = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.16, 0.62), material);
+        foot.position.set(0, -1.20, 0.20);
+        knee.add(foot);
+        return { hip, knee, thigh, shin, foot };
+      }
+
+      scene.add(root);
+
+      return {
+        root, pelvis, chest, spine, head,
+        leftArm: makeArm(-1), rightArm: makeArm(1), 
+        leftLeg: makeLeg(-1), rightLeg: makeLeg(1),
+        baseX,
+        state: {
+          // Tight phase spread so they stay synced with each other and the beat.
+          // Small offset (±0.12 rad) keeps them from looking robotically identical.
+          phase: (index - (numFigures - 1) / 2) * 0.025 + (Math.random() - 0.5) * 0.12,
+          stepSide: index % 2 === 0 ? 1 : -1,
+          // Modular dance: pick one upper move + one lower move independently.
+          // 8 × 8 = 64 combinations, refreshed on independent timers.
+          upperStyle: index % 8,
+          lowerStyle: (index + 4) % 8,
+          nextUpperChange: 3 + Math.random() * 4,
+          nextLowerChange: 4 + Math.random() * 4,
+          lastTier: 0
+        }
+      };
+    }
+
+    for (let i = 0; i < numFigures; i++) {
+      const x = i * spacing - lineWidth / 2;
+      figures.push(buildStickFigure(i, x, colors[i % colors.length]));
+    }
+
+    // ---------- Audio ----------
+    const audioElement = document.getElementById('audio-element');
+    let audioContext = null;
+    let analyser = null;
+    let dataArray = null;
+    let mediaSource = null;
+    let objectUrl = null;
+    let isPlaying = false;
+
+    const audio = {
+      bass: 0, mid: 0, treble: 0, energy: 0,
+      bassRaw: 0, midRaw: 0, trebleRaw: 0, energyRaw: 0
+    };
+
+    function averageBins(start, end) {
+      if (!dataArray || dataArray.length === 0) return 0;
+      const lo = clamp(Math.floor(start), 0, dataArray.length - 1);
+      const hi = clamp(Math.floor(end), lo + 1, dataArray.length);
+      let sum = 0;
+      for (let i = lo; i < hi; i++) sum += dataArray[i];
+      return sum / ((hi - lo) * 255);
+    }
+
+    function setupAudioGraph() {
+      if (!audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.60;
+        dataArray = new Uint8Array(analyser.frequencyBinCount);
+      }
+      if (!mediaSource) {
+        mediaSource = audioContext.createMediaElementSource(audioElement);
+        mediaSource.connect(analyser);
+        analyser.connect(audioContext.destination);
+      }
+    }
+
+    document.getElementById('audio-upload').addEventListener('change', async (event) => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      objectUrl = URL.createObjectURL(file);
+      audioElement.src = objectUrl;
+      audioElement.style.display = 'block';
+
+      setupAudioGraph();
+      try {
+        await audioContext.resume();
+        await audioElement.play();
+        isPlaying = true;
+      } catch (err) {
+        console.warn('Playback blocked:', err);
+      }
+    });
+
+    audioElement.addEventListener('play', async () => {
+      setupAudioGraph();
+      if (audioContext.state !== 'running') await audioContext.resume();
+      isPlaying = true;
+    });
+    audioElement.addEventListener('pause', () => isPlaying = false);
+    audioElement.addEventListener('ended', () => isPlaying = false);
+
+    // ---------- Animation ----------
+    const clock = new THREE.Clock();
+    let globalGroupX = 0;
+    let beatPulse = 0;
+    let lastBass = 0;
+
+    const SPEED_MULTIPLIER = 2.5;
+    let dancePhase = 0;
+    let estimatedTempo = 8.5; 
+    let beatConfidence = 0;
+    let lastBeatTime = -999;
+
+    // Tempo multiplier: dance speed follows song intensity (chill → hyped).
+    // Updated each frame in readAudio() from energy + bass. Range chosen to
+    // give noticeable dynamic spread without going so extreme that phase-lock
+    // can't recover when intensity drops back. Integer multiples (1×, 2×)
+    // stay phase-aligned with the song; non-integer values let phase drift
+    // freely, which the lock-gate compensates for.
+    let tempoMultiplier = 1.0;
+
+    // Dance gate: continuous smooth control over how much the figures move.
+    // Bass-weighted because dropping the backtrack usually drops the bass
+    // first, even when vocals/hats remain.
+    let danceGate = 0;     // 0 = frozen, 1 = full dance (smoothed)
+
+    function updateDanceGate(dt) {
+      const drive = audio.bass * 0.70 + audio.energy * 0.30;
+      // Continuous mapping: drive ↦ gate.
+      //   drive < 0.15  → gate ≈ 0  (genuine breakdown / silence)
+      //   drive ≈ 0.30  → gate ≈ 0.4 (verse-level intensity)
+      //   drive > 0.50  → gate = 1   (chorus / drop)
+      // Replaces the binary hysteresis from earlier versions, which latched
+      // open through whole songs and never registered section dynamics.
+      const targetGate = smoothstep(0.15, 0.50, drive);
+      // Asymmetric tracking: open fast (drops should hit), close gently.
+      const opening = targetGate > danceGate;
+      const rate = opening ? 14 : 5;
+      danceGate = lerp(danceGate, targetGate, 1 - Math.exp(-rate * dt));
+    }
+
+    function readAudio(dt) {
+      if (isPlaying && analyser) {
+        analyser.getByteFrequencyData(dataArray);
+        audio.bassRaw = averageBins(1, 10);
+        audio.midRaw = averageBins(10, 55);
+        audio.trebleRaw = averageBins(55, 150);
+        audio.energyRaw = (audio.bassRaw * 1.2 + audio.midRaw + audio.trebleRaw * 0.75) / 2.95;
+
+        // FIXED: Lowered the silence threshold significantly so normal quiet parts don't freeze them
+        if (audio.energyRaw < 0.005) {
+            audio.bassRaw = audio.midRaw = audio.trebleRaw = audio.energyRaw = 0;
+        }
+      } else {
+        audio.bassRaw = audio.midRaw = audio.trebleRaw = audio.energyRaw = 0;
+      }
+
+      const follow = 1 - Math.pow(0.001, dt); 
+      audio.bass = lerp(audio.bass, audio.bassRaw, follow * 0.46);
+      audio.mid = lerp(audio.mid, audio.midRaw, follow * 0.38);
+      audio.treble = lerp(audio.treble, audio.trebleRaw, follow * 0.34);
+      audio.energy = lerp(audio.energy, Math.pow(audio.energyRaw, 0.66), follow * 0.42);
+
+      // Dance-speed-follows-intensity. Bass-weighted so drops/heavy parts
+      // really push the tempo up. Range 0.80× → 1.55× covers chill bobbing
+      // through hyped near-double-time.
+      const intensity = smoothstep(0.10, 0.85, audio.energy + audio.bass * 0.35);
+      tempoMultiplier = lerp(0.80, 1.55, intensity);
+
+      const bassHit = audio.bass - lastBass;
+      if (bassHit > 0.10 && audio.bass > 0.32) {
+        beatPulse = 1;
+        const now = clock.getElapsedTime();
+        const interval = now - lastBeatTime;
+        if (interval > 0.24 && interval < 1.25) {
+          const instantTempo = clamp(TAU / interval, 4.0, 25.0);
+          estimatedTempo = lerp(estimatedTempo, instantTempo, 0.22);
+          beatConfidence = clamp(beatConfidence + 0.22, 0, 1);
+        }
+        lastBeatTime = now;
+
+        // Phase-lock: snap dancePhase toward π/2 each beat ("peak on the
+        // kick"). Lock fights the multiplier when the multiplier isn't an
+        // integer ratio of beat rate, so gate the lock strength by a
+        // gaussian centered on 1×. At extremes (0.8× or 1.5×) the lock is
+        // ~0 and dancePhase free-runs at the multiplier rate.
+        const lockGate = Math.exp(-Math.pow((tempoMultiplier - 1.0) * 4, 2));
+        const TARGET_PHASE = Math.PI / 2;
+        const wrapped = ((dancePhase % TAU) + TAU) % TAU;
+        let err = TARGET_PHASE - wrapped;
+        if (err > Math.PI)  err -= TAU;
+        if (err < -Math.PI) err += TAU;
+        dancePhase += err * 0.40 * lockGate;
+      }
+      beatPulse = Math.max(0, beatPulse - dt * 5.2);
+      beatConfidence = Math.max(0, beatConfidence - dt * 0.10);
+      lastBass = audio.bass;
+    }
+
+    function updateDanceClock(dt) {
+      const loudness = smoothstep(0.12, 0.82, audio.energy + audio.bass * 0.22 + audio.mid * 0.12);
+      const fallbackTempo = lerp(1.15, 6.20, loudness) * SPEED_MULTIPLIER;
+      // tempoMultiplier is set in readAudio() each frame from intensity.
+      // estimatedTempo lerps toward the detected beat rate, so when chorus
+      // drums double up the kicks, estimatedTempo doubles within a few beats
+      // and dancePhase advances correspondingly faster — the dancers feel
+      // the chorus as faster without us having to flag "this is a chorus".
+      const beatLockedTempo = estimatedTempo * tempoMultiplier;
+      const targetTempo = lerp(fallbackTempo, beatLockedTempo, beatConfidence * 0.78);
+      dancePhase += targetTempo * dt;
+      if (dancePhase > 100000) dancePhase %= TAU;
+    }
+
+    function timeSeed(fig, scale) {
+      return (clock.getElapsedTime() * scale + fig.state.phase * 13.371) % 997;
+    }
+
+    function moveTier() {
+      // Gate near 0 → freeze completely. Bones lerp back to neutral via
+      // the defaults at the top of applyNaturalDance. Threshold is low so
+      // the continuous gate can scale motion smoothly through quiet sections
+      // without snapping into freeze prematurely.
+      if (!isPlaying || danceGate < 0.08) return 0;
+      if (audio.energy < 0.15) return 1;                    
+      if (audio.energy < 0.35) return 2;                    
+      if (audio.energy < 0.60) return 3;                    
+      return 4;                                             
+    }
+
+    // Upper-body move catalog:
+    //   u0 = sway,         u1 = head-nod,    u2 = popping,      u3 = arm-wave,
+    //   u4 = disco-point,  u5 = helicopter,  u6 = chest-pump,   u7 = robot,
+    //   u8 = vogue-frame,  u9 = carlton,     u10 = sky-reach,   u11 = body-roll
+    //
+    // Tier 4 exclusively: helicopter, carlton, sky-reach. These are the moves
+    // that look like "throwing it down" — full overhead arm rotations, big
+    // sideways swings, straight-up reaches. They're reserved for the chorus
+    // drop (audio.energy ≥ 0.60). Tier 3 ("groovy", roughly verse-loud) gets
+    // expressive moves like arm-wave, disco-point, chest-pump, but nothing
+    // that would look manic during a calm section.
+    function chooseUpperForTier(tier) {
+      const trebleLead = audio.treble > audio.mid && audio.treble > 0.20;
+      let pool;
+      if (tier === 1)      pool = [0, 1, 7, 11];                                // chill
+      else if (tier === 2) pool = [0, 1, 2, 7, 8, 11];                          // medium: + popping, vogue
+      else if (tier === 3) pool = trebleLead ? [2, 3, 4, 6, 8, 11]              // groovy: + arm-wave, disco-point, chest-pump
+                                             : [1, 2, 3, 4, 6, 7, 11];
+      else                 pool = [3, 4, 5, 5, 6, 9, 10];                       // wild: helicopter (×2), carlton, sky-reach
+      return pool[Math.floor(Math.random() * pool.length)];
+    }
+
+    // Lower-body move catalog:
+    //   l0 = bounce,        l1 = side-step,    l2 = forward-back-step (Pooh),
+    //   l3 = running-man,   l4 = charleston,   l5 = hip-sway,
+    //   l6 = front-kicks,   l7 = cha-cha,      l8 = heel-toe,
+    //   l9 = squat-pop,     l10 = swivel,      l11 = heavy-stomps
+    //
+    // Tier 4 exclusively: running-man, front-kicks, squat-pop, heavy-stomps.
+    // Big knee lifts, body drops, foot-slamming. Charleston scissor-kicks
+    // stay accessible at tier 3 — they read as rhythmic rather than emphatic.
+    function chooseLowerForTier(tier) {
+      const bassLead = audio.bass > audio.mid && audio.bass > 0.28;
+      let pool;
+      if (tier === 1)      pool = [0, 5, 7, 8];                                  // chill
+      else if (tier === 2) pool = [0, 1, 2, 5, 7, 8];                            // medium: + side-step, fwd-back
+      else if (tier === 3) pool = bassLead ? [1, 2, 4, 5, 7, 10]                 // groovy: + charleston, swivel
+                                           : [1, 2, 4, 7, 8, 10];
+      else                 pool = [2, 3, 3, 4, 6, 9, 11, 11];                    // wild: running-man (×2), front-kicks, squat-pop, heavy-stomps (×2)
+      return pool[Math.floor(Math.random() * pool.length)];
+    }
+
+    function easeRot(obj, x, y, z, dt, rate = 9.5) {
+      const k = 1 - Math.exp(-rate * dt);
+      obj.rotation.x = lerp(obj.rotation.x, x, k);
+      obj.rotation.y = lerp(obj.rotation.y, y, k);
+      obj.rotation.z = lerp(obj.rotation.z, z, k);
+    }
+
+    function applyNaturalDance(fig, time, dt) {
+      const s = fig.state;
+      const tier = moveTier();
+      const active = tier > 0;
+      
+      // Steeper exponent (1.6 vs old 1.2) so quiet sections get visibly
+      // smaller motion while loud sections still hit full strength.
+      const energy = active ? Math.pow(smoothstep(0.005, 0.70, audio.energy), 1.6) * danceGate : 0;
+      const humanLag = 0.18 * Math.sin(time * 0.73 + s.phase);
+
+      const loudness = smoothstep(0.12, 0.82, audio.energy + audio.bass * 0.22 + audio.mid * 0.12);
+      const accentTempo = lerp(1.15, 2.65, loudness);
+      // Lower amp floor (0.20 vs old 0.48) gives much more dynamic range
+      // between quiet sections and choruses (~7.75× span instead of ~3.2×).
+      const amp = lerp(0.20, 1.55, loudness) * danceGate;
+      const beat = dancePhase + s.phase;
+      const halfBeat = beat * 0.5;
+      const fastBeat = beat * accentTempo;
+      const step = Math.sin(beat);
+      const otherStep = Math.sin(beat + Math.PI);
+      const lift = Math.max(0, step);
+      const liftOther = Math.max(0, otherStep);
+      const side = s.stepSide;
+      const sway = Math.sin(halfBeat + humanLag) * side * amp;
+      const bassHit = clamp(audio.bass * 0.9 + beatPulse * 0.65, 0, 1);
+      const trebleHit = clamp(audio.treble * 1.05 + beatPulse * 0.35, 0, 1);
+      const midDrive = clamp(audio.mid * 1.15 + energy * 0.25, 0, 1);
+
+      if (active) {
+        if (s.lastTier !== tier || time > s.nextUpperChange) {
+          s.upperStyle = chooseUpperForTier(tier);
+          s.nextUpperChange = time + lerp(4.2, 0.95, loudness) + Math.random() * lerp(1.0, 0.28, loudness);
+        }
+        if (s.lastTier !== tier || time > s.nextLowerChange) {
+          s.lowerStyle = chooseLowerForTier(tier);
+          // Slightly different timer range than upper so the two drift out of lockstep
+          s.nextLowerChange = time + lerp(4.8, 1.10, loudness) + Math.random() * lerp(1.2, 0.30, loudness);
+        }
+        s.lastTier = tier;
+      }
+
+      let rootX = fig.baseX;
+      let rootY = 0.016 + 0.01 * Math.sin(time * 1.5 + s.phase);
+      let rootZ = 0, rootRX = 0, rootRY = 0, rootRZ = 0;
+      
+      let pelvisX = 0, pelvisY = 0, pelvisZ = 0;
+      let chestX = 0, chestY = 0, chestZ = 0;
+      let headX = 0.02 * Math.sin(time * 1.5 + s.phase), headY = 0, headZ = 0;
+      
+      let leftShoulderX = -0.1, rightShoulderX = -0.1, leftShoulderY = 0, rightShoulderY = 0;
+      let leftShoulderZ = 0.15, rightShoulderZ = -0.15;
+      let leftElbowX = -0.05, rightElbowX = -0.05, leftElbowZ = 0, rightElbowZ = 0;
+      
+      let leftHipX = 0, rightHipX = 0, leftHipY = 0, rightHipY = 0, leftHipZ = 0.1, rightHipZ = -0.1;
+      let leftKneeX = 0.05, rightKneeX = 0.05, leftFootX = 0, rightFootX = 0;
+
+      // FIXED: Lowered threshold here as well so they dance to softer music
+      if (active && audio.energy > 0.01) {
+          // Stepping motion baked into the base — figures actually translate
+          // around instead of floating in place. Two layers per axis:
+          //   • beat-coupled step (sin(halfBeat) * energy * amp): scales with
+          //     song intensity, syncs to the dance phase.
+          //   • slow wander (sin(time * slow) * danceGate * energy): ambient
+          //     drift that ALSO scales with energy, so quiet sections lose
+          //     most of the wander instead of drifting at full amplitude.
+          rootX = fig.baseX
+                + 0.30 * Math.sin(halfBeat) * energy * side * amp
+                + 0.10 * Math.sin(time * 0.32 + fig.baseX * 0.23) * danceGate * energy;
+          rootY = 0.018 + 0.050 * audio.bass * amp + 0.035 * beatPulse * loudness;
+          rootZ = 0.25 * Math.cos(halfBeat + s.phase) * energy * amp
+                + 0.14 * Math.sin(time * 0.41 + fig.baseX * 0.17) * danceGate * energy;
+          rootRY = side * (0.035 + 0.12 * Math.sin(halfBeat) * energy * amp);
+          rootRZ = 0.032 * sway * energy;
+
+          pelvisX = -0.03 + 0.050 * Math.sin(beat + 0.3) * energy * amp;
+          pelvisY = 0.020 * Math.sin(halfBeat) * energy;
+          pelvisZ = -0.10 * sway * energy;
+          
+          chestX = -0.035 + 0.095 * bassHit * amp + 0.065 * Math.sin(beat + 0.9) * energy * amp;
+          chestY = 0.13 * Math.sin(halfBeat + Math.PI) * energy;
+          chestZ = 0.15 * sway * energy;
+          
+          headX = -0.30 * chestX + 0.025 * Math.sin(beat * 0.7 + s.phase);
+          headY = -0.20 * chestY + 0.035 * Math.sin(halfBeat + s.phase) * energy;
+          headZ = -0.33 * chestZ;
+
+          leftShoulderX = 0.32 * otherStep * energy * amp - 0.05;
+          rightShoulderX = 0.32 * step * energy * amp - 0.05;
+          leftShoulderY = 0.035 * Math.sin(beat + 0.4);
+          rightShoulderY = -0.035 * Math.sin(beat + 0.4);
+          leftShoulderZ = 0.15 - 0.17 * sway * energy;
+          rightShoulderZ = -0.15 - 0.17 * sway * energy;
+          
+          leftElbowX = -0.38 - 0.25 * liftOther * energy;
+          rightElbowX = -0.38 - 0.25 * lift * energy;
+          leftElbowZ = 0.040 * Math.sin(beat);
+          rightElbowZ = -0.040 * Math.sin(beat);
+
+          leftHipX = -0.12 + 0.38 * step * energy * amp;
+          rightHipX = -0.12 + 0.38 * otherStep * energy * amp;
+          leftHipZ = 0.08 * side + 0.12 * sway * energy;
+          rightHipZ = -0.08 * side + 0.12 * sway * energy;
+          
+          leftKneeX = 0.26 + 0.48 * lift * energy * amp;
+          rightKneeX = 0.26 + 0.48 * liftOther * energy * amp;
+          leftFootX = -0.16 - 0.10 * lift * energy;
+          rightFootX = -0.16 - 0.10 * liftOther * energy;
+
+          switch (s.upperStyle) {
+            case 0: { // u0: gentle two-step sway (chill default)
+              chestZ += 0.10 * sway * midDrive;
+              chestY += 0.05 * Math.sin(beat) * energy;
+              headZ += -0.06 * sway;
+              leftShoulderZ  += 0.10 * Math.sin(halfBeat) * side * midDrive;
+              rightShoulderZ -= 0.10 * Math.sin(halfBeat) * side * midDrive;
+              break;
+            }
+            case 1: { // u1: head nod + shoulder roll
+              chestX += 0.10 * Math.sin(beat * 0.85) * midDrive + 0.08 * Math.sin(fastBeat * 1.25) * loudness;
+              chestY += 0.10 * Math.sin(beat * 0.85 + Math.PI / 2) * midDrive;
+              headX  += 0.18 * Math.sin(beat) * midDrive;
+              leftShoulderX  += 0.16 * Math.sin(beat * 0.85 + 1.2) * midDrive;
+              rightShoulderX += 0.16 * Math.sin(beat * 0.85 - 1.2) * midDrive;
+              break;
+            }
+            case 2: { // u2: popping hits — staccato chest/shoulder snaps
+              const hit = Math.pow(trebleHit, 1.1) * lerp(0.75, 1.55, loudness);
+              chestX += 0.12 * hit * Math.sign(Math.sin(beat * 1.7) || 1);
+              headY  += 0.12 * hit * side;
+              leftShoulderZ  += side * (0.30 + 0.22 * Math.sin(beat * 1.7)) * hit;
+              rightShoulderZ -= side * (0.30 + 0.22 * Math.cos(beat * 1.7)) * hit;
+              leftElbowX  -= 0.42 * hit;
+              rightElbowX -= 0.42 * hit;
+              leftElbowZ  += 0.12 * hit;
+              rightElbowZ -= 0.12 * hit;
+              break;
+            }
+            case 3: { // u3: sequential arm wave
+              const wave = beat * lerp(0.9, 1.35, loudness);
+              chestZ += 0.18 * Math.sin(wave - 0.2) * energy * side;
+              headZ  += -0.12 * Math.sin(wave + 0.4) * energy * side;
+              leftShoulderX  += 0.38 * Math.sin(wave) * energy;
+              leftElbowX     += 0.35 * Math.sin(wave - 0.7) * energy;
+              rightShoulderX += 0.38 * Math.sin(wave - 1.2) * energy;
+              rightElbowX    += 0.35 * Math.sin(wave - 1.9) * energy;
+              leftShoulderZ  += side * 0.35 * energy;
+              rightShoulderZ -= side * 0.35 * energy;
+              break;
+            }
+            case 4: { // u4: disco point — alternating diagonal arm raise
+              const point = Math.sin(beat * 0.85);
+              chestX += 0.06 * Math.abs(point) * midDrive;
+              headZ  += 0.08 * point * side;
+              if (point > 0) {
+                rightShoulderX = -2.30; rightShoulderZ = -0.85; rightElbowX = -0.08;
+                leftShoulderX  = -0.45; leftShoulderZ  =  0.95; leftElbowX  = -1.55;
+              } else {
+                leftShoulderX  = -2.30; leftShoulderZ  =  0.85; leftElbowX  = -0.08;
+                rightShoulderX = -0.45; rightShoulderZ = -0.95; rightElbowX = -1.55;
+              }
+              break;
+            }
+            case 5: { // u5: helicopter windmill arms
+              chestY += 0.10 * Math.sin(beat) * energy;
+              chestX += 0.15 * Math.sin(halfBeat) * energy;
+              headX  -= 0.15;
+              leftShoulderX  = Math.sin(fastBeat * 2.5) * Math.PI;
+              leftShoulderZ  = Math.cos(fastBeat * 2.5) * Math.PI;
+              rightShoulderX = Math.sin(fastBeat * 2.5 + Math.PI) * Math.PI;
+              rightShoulderZ = Math.cos(fastBeat * 2.5 + Math.PI) * Math.PI;
+              leftElbowX = 0; rightElbowX = 0;
+              leftElbowZ = 0; rightElbowZ = 0;
+              break;
+            }
+            case 6: { // u6: chest pump on bass hits
+              const pump = Math.pow(bassHit, 0.8);
+              chestX += 0.32 * pump;
+              chestY += 0.08 * Math.sin(halfBeat) * midDrive;
+              headX  -= 0.28 * pump;
+              leftShoulderX  += 0.32 * pump;
+              rightShoulderX += 0.32 * pump;
+              leftElbowX  += 0.18 * pump;
+              rightElbowX += 0.18 * pump;
+              break;
+            }
+            case 7: { // u7: robot lock — quantized snaps + right-angle forearms
+              const lockStep = Math.floor(beat * 2) * 0.5;
+              const locked = Math.sin(lockStep);
+              const lockedAlt = Math.sin(lockStep + Math.PI / 2);
+              const tickSide = (Math.floor(beat) % 2 === 0) ? 1 : -1;
+              chestX += 0.05 * locked * midDrive;
+              chestY += 0.18 * lockedAlt * midDrive;
+              headY  += 0.32 * tickSide * midDrive;
+              headX  += 0.05 * locked;
+              leftShoulderX  = -0.20 + 0.55 * locked * energy;
+              rightShoulderX = -0.20 - 0.55 * locked * energy;
+              leftShoulderZ  =  side * (0.55 + 0.40 * lockedAlt) * energy;
+              rightShoulderZ = -side * (0.55 + 0.40 * lockedAlt) * energy;
+              leftElbowX  = -1.35;
+              rightElbowX = -1.35;
+              leftElbowZ  =  0.15 * locked;
+              rightElbowZ = -0.15 * locked;
+              break;
+            }
+            case 8: { // u8: vogue framing — arms make geometric shapes around the head
+              const frame = Math.sin(beat * 0.85);
+              chestY += 0.08 * Math.sin(beat * 1.7) * midDrive;
+              headZ  += 0.15 * frame * side;
+              // Both arms come up to frame the face, palms square
+              leftShoulderX  = -1.85 + 0.18 * frame;
+              rightShoulderX = -1.85 + 0.18 * frame;
+              leftShoulderZ  =  0.95;
+              rightShoulderZ = -0.95;
+              leftElbowX  = -1.50 - 0.30 * Math.abs(frame); // sharp picture-frame angles
+              rightElbowX = -1.50 - 0.30 * Math.abs(frame);
+              break;
+            }
+            case 9: { // u9: Carlton swing — both arms swing side-to-side in big arcs
+              const swing = Math.sin(beat * lerp(0.9, 1.4, loudness));
+              chestZ += 0.10 * swing * side * midDrive;
+              headZ  += 0.05 * swing * side;
+              leftShoulderX  = -0.30;
+              rightShoulderX = -0.30;
+              leftShoulderZ  =  0.40 + 0.95 * swing;  // both arms swing same direction
+              rightShoulderZ = -0.40 + 0.95 * swing;
+              leftElbowX  = -0.45;
+              rightElbowX = -0.45;
+              leftElbowZ  =  0.10 * swing;
+              rightElbowZ =  0.10 * swing;
+              break;
+            }
+            case 10: { // u10: sky reaches — arms pump upward alternately
+              const reachL = Math.max(0, Math.sin(beat));
+              const reachR = Math.max(0, Math.sin(beat + Math.PI));
+              chestX += 0.08 * Math.max(reachL, reachR) * midDrive;
+              headX  -= 0.10 * Math.max(reachL, reachR);
+              leftShoulderX  = -0.30 - 1.85 * reachL;     // straight up when reaching
+              rightShoulderX = -0.30 - 1.85 * reachR;
+              leftShoulderZ  =  0.30 - 0.45 * reachL;
+              rightShoulderZ = -0.30 + 0.45 * reachR;
+              leftElbowX  = -0.10 - 0.40 * (1 - reachL);  // straightens when up, bends when down
+              rightElbowX = -0.10 - 0.40 * (1 - reachR);
+              break;
+            }
+            case 11: { // u11: body roll — wave traveling top-down through chest
+              const roll = beat * lerp(0.85, 1.30, loudness);
+              chestX += 0.30 * Math.sin(roll) * midDrive;
+              chestY += 0.15 * Math.sin(roll - 0.4) * midDrive;
+              chestZ += 0.18 * Math.sin(roll + 0.6) * side * midDrive;
+              headX  += -0.25 * Math.sin(roll - 0.7) * midDrive;
+              leftShoulderZ  += 0.20 * Math.sin(roll - 0.3);
+              rightShoulderZ -= 0.20 * Math.sin(roll - 0.3);
+              break;
+            }
+          }
+
+          // ===== Lower-body switch (hips/knees/feet + root translation) =====
+          switch (s.lowerStyle) {
+            case 0: { // l0: bounce — knees flex on the beat
+              rootY += 0.045 * midDrive * amp * Math.max(0, Math.sin(beat + 0.2));
+              leftKneeX  += 0.20 * lift;
+              rightKneeX += 0.20 * liftOther;
+              pelvisZ    += -0.06 * sway * midDrive;
+              break;
+            }
+            case 1: { // l1: side-step touch
+              rootX += 0.18 * Math.sin(halfBeat) * side * energy * amp;
+              leftHipX  += 0.15 * lift;
+              rightHipX += 0.15 * liftOther;
+              leftHipZ  += 0.20 * lift * side;
+              rightHipZ -= 0.20 * liftOther * side;
+              leftKneeX  += 0.30 * lift;
+              rightKneeX += 0.30 * liftOther;
+              break;
+            }
+            case 2: { // l2: forward-back step (the Pooh sway)
+              const fwd = Math.sin(beat);          // -1 = back, +1 = forward
+              const fwdAbs = Math.abs(fwd);
+              rootZ  += 0.55 * fwd * energy * amp;       // body translates fore/aft
+              rootRX += -0.05 * fwd * energy;            // tiny lean into the step
+              rootY  += 0.030 * Math.abs(Math.sin(beat * 2)) * amp; // small bounce on the swap
+              const bendL = Math.max(0, Math.sin(beat));
+              const bendR = Math.max(0, Math.sin(beat + Math.PI));
+              leftHipX  += 0.25 * bendL;
+              rightHipX += 0.25 * bendR;
+              leftKneeX  += 0.30 * bendL;
+              rightKneeX += 0.30 * bendR;
+              break;
+            }
+            case 3: { // l3: running man — high-knee in-place
+              const runPhase = beat * lerp(1.0, 1.55, loudness);
+              const runL = Math.max(0, Math.sin(runPhase));
+              const runR = Math.max(0, Math.sin(runPhase + Math.PI));
+              rootY     += 0.060 * (runL + runR) * energy * amp;
+              leftHipX  += 1.10 * runL * amp;
+              rightHipX += 1.10 * runR * amp;
+              leftKneeX  += 0.85 * runL;
+              rightKneeX += 0.85 * runR;
+              leftFootX  -= 0.20 * runL;
+              rightFootX -= 0.20 * runR;
+              break;
+            }
+            case 4: { // l4: charleston scissor kicks
+              const charlPhase = beat * lerp(0.85, 1.20, loudness);
+              const kickL = Math.sin(charlPhase);
+              const kickR = Math.sin(charlPhase + Math.PI);
+              rootY     += 0.055 * Math.abs(Math.sin(charlPhase * 2)) * amp;
+              leftHipX  += 0.45 * Math.max(0, kickL) * amp;
+              rightHipX += 0.45 * Math.max(0, kickR) * amp;
+              leftHipZ  += 0.45 * kickL * amp;   // crossing in/out
+              rightHipZ -= 0.45 * kickR * amp;
+              leftKneeX  += 0.55 * Math.max(0, kickL);
+              rightKneeX += 0.55 * Math.max(0, kickR);
+              leftFootX  -= 0.20;
+              rightFootX -= 0.20;
+              break;
+            }
+            case 5: { // l5: hip sway — smooth lateral rock
+              rootX += 0.13 * Math.sin(halfBeat) * side * energy * amp;
+              leftHipZ  += 0.18 * Math.sin(halfBeat + 0.2) * side * midDrive;
+              rightHipZ -= 0.18 * Math.sin(halfBeat + 0.2) * side * midDrive;
+              leftKneeX  += 0.10 * lift;
+              rightKneeX += 0.10 * liftOther;
+              break;
+            }
+            case 6: { // l6: alternating front kicks
+              const kickL = Math.max(0, Math.sin(beat * lerp(0.5, 0.9, loudness)));
+              const kickR = Math.max(0, Math.sin(beat * lerp(0.5, 0.9, loudness) + Math.PI));
+              rootY     += 0.055 * (kickL + kickR) * energy * amp;
+              leftHipX  += 0.72 * kickL * midDrive * amp;
+              rightHipX += 0.72 * kickR * midDrive * amp;
+              leftKneeX  = 0.20 + 0.18 * (1 - kickL); // straightens when kicking
+              rightKneeX = 0.20 + 0.18 * (1 - kickR);
+              leftFootX  -= 0.28 * kickL;
+              rightFootX -= 0.28 * kickR;
+              break;
+            }
+            case 7: { // l7: cha-cha — quick triple step in place
+              const cha = beat * 1.6;
+              const stepL = Math.max(0, Math.sin(cha));
+              const stepR = Math.max(0, Math.sin(cha + Math.PI));
+              rootX += 0.06 * Math.sin(cha) * side * energy;
+              rootY += 0.025 * (stepL + stepR) * midDrive;
+              leftHipX  += 0.25 * stepL * amp;
+              rightHipX += 0.25 * stepR * amp;
+              leftKneeX  += 0.32 * stepL;
+              rightKneeX += 0.32 * stepR;
+              leftFootX  -= 0.15 * stepL;
+              rightFootX -= 0.15 * stepR;
+              break;
+            }
+            case 8: { // l8: heel-toe — alternating heel-down / toe-down rocks
+              const stepPhase = beat * lerp(0.9, 1.3, loudness);
+              const stepL = Math.sin(stepPhase);
+              const stepR = Math.sin(stepPhase + Math.PI);
+              rootY += 0.030 * Math.abs(Math.sin(stepPhase * 2)) * amp;
+              leftHipX  += 0.40 * Math.max(0, stepL) * amp;
+              rightHipX += 0.40 * Math.max(0, stepR) * amp;
+              leftKneeX  += 0.35 * Math.max(0, stepL);
+              rightKneeX += 0.35 * Math.max(0, stepR);
+              // Foot tips heel-up / toe-down rocking through the cycle
+              leftFootX  += 0.55 * stepL;
+              rightFootX += 0.55 * stepR;
+              break;
+            }
+            case 9: { // l9: squat-pop — drop low, then pop up on the bass hit
+              const cycle = Math.sin(beat * 0.5);            // one squat-pop per 2 beats
+              const squat = Math.max(0, -cycle);              // 0..1, only when going low
+              const pop   = Math.max(0,  cycle) * Math.pow(bassHit, 0.5);
+              rootY     += -0.42 * squat * amp + 0.18 * pop * amp;
+              leftHipX  += 0.85 * squat;
+              rightHipX += 0.85 * squat;
+              leftKneeX  += 0.75 * squat;
+              rightKneeX += 0.75 * squat;
+              leftHipZ  += 0.20 * squat * side;              // stance widens slightly
+              rightHipZ -= 0.20 * squat * side;
+              break;
+            }
+            case 10: { // l10: swivel — figure pivots left/right around vertical axis
+              const swivel = Math.sin(beat * lerp(0.7, 1.0, loudness));
+              rootRY += 0.25 * swivel * side;                 // whole-body Y rotation
+              leftKneeX  += 0.15 * Math.abs(swivel);          // soft knee bend on each pivot
+              rightKneeX += 0.15 * Math.abs(swivel);
+              leftHipZ  += 0.10 * swivel;
+              rightHipZ -= 0.10 * swivel;
+              break;
+            }
+            case 11: { // l11: heavy stomps — emphatic alternating foot stomps
+              const stompL = Math.max(0, Math.sin(beat));
+              const stompR = Math.max(0, Math.sin(beat + Math.PI));
+              rootY += 0.075 * (stompL + stompR) * energy * amp;
+              leftHipX  += 0.60 * stompL * amp;
+              rightHipX += 0.60 * stompR * amp;
+              leftKneeX  = 0.40 + 0.65 * stompL;
+              rightKneeX = 0.40 + 0.65 * stompR;
+              // Feet slap down hard between lifts
+              leftFootX  -= 0.45 * (1 - stompL);
+              rightFootX -= 0.45 * (1 - stompR);
+              break;
+            }
+          }
+      }
+
+      rootY = Math.max(0.012, rootY);
+      rootRX = clamp(rootRX, -0.06, 0.06);
+      rootRY = clamp(rootRY, -0.32, 0.32);
+      rootRZ = clamp(rootRZ, -0.10, 0.10);
+      rootZ  = clamp(rootZ,  -1.40, 1.40); // bound forward-back step travel
+      pelvisX = clamp(pelvisX, -0.85, 0.75);
+      pelvisY = clamp(pelvisY, -0.35, 0.35);
+      pelvisZ = clamp(pelvisZ, -0.55, 0.55);
+      chestX = clamp(chestX, -0.35, 0.90);
+      chestY = clamp(chestY, -0.45, 0.45);
+      chestZ = clamp(chestZ, -0.62, 0.62);
+      leftHipX = clamp(leftHipX, -0.75, 1.20);
+      rightHipX = clamp(rightHipX, -0.75, 1.20);
+      leftKneeX = clamp(leftKneeX, 0.05, 1.15);
+      rightKneeX = clamp(rightKneeX, 0.05, 1.15);
+
+      const rootFollow = 1 - Math.exp(-7.5 * dt);
+      fig.root.position.x = lerp(fig.root.position.x, rootX, rootFollow);
+      fig.root.position.y = lerp(fig.root.position.y, rootY, rootFollow);
+      fig.root.position.z = lerp(fig.root.position.z, rootZ, rootFollow);
+
+      const snap = lerp(1.5, 14.0, loudness);
+      easeRot(fig.root, rootRX, rootRY, rootRZ, dt, 7.5 + snap * 0.35);
+      easeRot(fig.pelvis, pelvisX, pelvisY, pelvisZ, dt, 8.2 + snap * 0.45);
+      easeRot(fig.chest, chestX, chestY, chestZ, dt, 8.6 + snap * 0.55);
+      easeRot(fig.head, headX, headY, headZ, dt, 7.8 + snap * 0.35);
+      easeRot(fig.leftArm.shoulder, leftShoulderX, leftShoulderY, leftShoulderZ, dt, 10.0 + snap);
+      easeRot(fig.rightArm.shoulder, rightShoulderX, rightShoulderY, rightShoulderZ, dt, 10.0 + snap);
+      easeRot(fig.leftArm.elbow, leftElbowX, 0, leftElbowZ, dt, 11.0 + snap);
+      easeRot(fig.rightArm.elbow, rightElbowX, 0, rightElbowZ, dt, 11.0 + snap);
+      easeRot(fig.leftLeg.hip, leftHipX, leftHipY, leftHipZ, dt, 9.8 + snap * 0.85);
+      easeRot(fig.rightLeg.hip, rightHipX, rightHipY, rightHipZ, dt, 9.8 + snap * 0.85);
+      easeRot(fig.leftLeg.knee, leftKneeX, 0, 0, dt, 11.0 + snap * 0.9);
+      easeRot(fig.rightLeg.knee, rightKneeX, 0, 0, dt, 11.0 + snap * 0.9);
+      fig.leftLeg.foot.rotation.x = lerp(fig.leftLeg.foot.rotation.x, leftFootX, 1 - Math.exp(-10.0 * dt));
+      fig.rightLeg.foot.rotation.x = lerp(fig.rightLeg.foot.rotation.x, rightFootX, 1 - Math.exp(-10.0 * dt));
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = Math.min(clock.getDelta(), 0.05);
+      const time = clock.getElapsedTime();
+
+      readAudio(dt);
+      updateDanceGate(dt);
+      updateDanceClock(dt);
+      figures.forEach(fig => applyNaturalDance(fig, time, dt));
+
+      camera.position.x = lerp(camera.position.x, globalGroupX * 0.08, 0.035);
+      camera.position.y = 7.8 + Math.sin(time * 0.18) * 0.35;
+      camera.position.z = 32 + Math.cos(time * 0.12) * 0.7;
+      camera.lookAt(globalGroupX * 0.05, 2.25, 0);
+
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    animate();
+  </script>
+</body>
+</html>
