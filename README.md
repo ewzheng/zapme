@@ -73,6 +73,8 @@ pip install -e .[pi]
 
 Make sure your user is in the `gpio` group (`sudo usermod -aG gpio $USER`, then re-login).
 
+Note that in our system, the GPIO pin has to be driven low to fire. Check your pin polarity to make sure you are not sending a continuous shock when you do not mean to.
+
 ## Run
 
 ### Try it without any hardware
