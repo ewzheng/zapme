@@ -233,9 +233,9 @@ zapme/
 - The TENS unit's intensity is set on the unit itself, not by the Pi. **Set it to a comfortable level with the pads on your skin before letting the Pi gate it.**
 - **Set the TENS output to deliver ≥3 V** to actually feel the pulse. Below that the stim is too weak to register through the EMS pads. We power the unit itself with a fresh 9 V battery so it has the headroom to hit that output level.
 - The relay is **active-LOW by default** so the line idles HIGH (de-energized) at boot, before Python is even running.
-- The watchdog forces the gate low on missing heartbeats, uncaught exceptions, signal handlers, and process exit. Don't disable it.
+- The watchdog forces the GPIO line off on missing heartbeats, uncaught exceptions, signal handlers, and process exit. Don't disable it.
 - `--cooldown 0` disables the post-pulse lockout. Don't.
-- Don't run unattended. Don't use on broken/wet skin, near the heart/throat, or with implanted electronics. Standard TENS contraindications apply.
+- Don't run unattended. Don't use on broken/wet skin, near the heart/throat, or with implanted electronics. Standard TENS contraindications apply. **DO NOT USE IF YOU HAVE PRE-EXISTING HEART CONDITIONS.**
 
 ## License
 
